@@ -56,16 +56,21 @@ def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, encoder, flow, lam_cyc, lam_i
 def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r):
     """
     Discriminator step: update D_R and D_S.
-    Generator outputs must be detached before feeding discriminators.
 
     Hinge loss (spec §1a):
       L_D_R = relu(1 - D_R(x_r)).mean() + relu(1 + D_R(x_sr.detach())).mean()
       L_D_S = relu(1 - D_S(x_s)).mean() + relu(1 + D_S(x_rs.detach())).mean()
-
-    Returns scalar loss and a dict of components for logging.
     """
-    # TODO
-    raise NotImplementedError
+    x_sr = G_sr(x_s).detach()
+    x_rs = G_rs(x_r).detach()
+
+    L_D_R = (torch.relu(1 - D_R(x_r)).mean()
+           + torch.relu(1 + D_R(x_sr)).mean())
+    L_D_S = (torch.relu(1 - D_S(x_s)).mean()
+           + torch.relu(1 + D_S(x_rs)).mean())
+
+    loss = L_D_R + L_D_S
+    return loss, {"D_R": L_D_R.item(), "D_S": L_D_S.item()}
 
 
 def loss_posterior(encoder, flow, x_s, theta, x_srs_detached, lam_info):
