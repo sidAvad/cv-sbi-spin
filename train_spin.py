@@ -76,14 +76,20 @@ def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r):
 def loss_posterior(encoder, flow, x_s, theta, x_srs_detached, lam_info):
     """
     Posterior step: update h_ω and q_ψ.
-    x_srs must already be detached (no grad into G from this step).
+    x_srs_detached must already be detached — no grad flows into G from this step.
 
-    L_NPE = -log q_ψ(θ | h_ω(x_s)) + lam_info * (-log q_ψ(θ | h_ω(x_srs_detached)))
-
-    Returns scalar loss and a dict of components for logging.
+    L_NPE = -log q_ψ(θ | h_ω(x_s))
+          + lam_info * (-log q_ψ(θ | h_ω(x_srs_detached)))
     """
-    # TODO
-    raise NotImplementedError
+    npe_sim = -flow.log_prob(theta, condition=encoder(x_s)).mean()
+
+    if x_srs_detached is not None and lam_info > 0:
+        npe_srs = -flow.log_prob(theta, condition=encoder(x_srs_detached)).mean()
+    else:
+        npe_srs = torch.zeros(1, device=x_s.device).squeeze()
+
+    loss = npe_sim + lam_info * npe_srs
+    return loss, {"npe_sim": npe_sim.item(), "npe_srs": npe_srs.item()}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
