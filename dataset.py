@@ -3,6 +3,8 @@ Dataset utilities for cv-sbi-spin (SPIN).
 
 Sim data: ReducedCVDataset — (theta_infer, x) pairs, legacy normalization.
 Real data: RealBeatsDataset — unlabeled x tensors from per-patient H5 files.
+
+Both datasets preload all data into RAM at init.
 """
 
 import json
@@ -40,66 +42,64 @@ class ReducedCVDataset(Dataset):
       x           : (809,) — 4 z-scored waveforms (4*201) + 5 scalars
                              scalars: MAP, SBP, DBP (via z-scored Pas), SV (via Vlv std), HR_z
 
-    Legacy normalization only: shared sim-fitted affine map for both sims and reals.
+    All data preloaded into RAM at init. self.theta and self.x are accessible
+    directly for theta stats collection etc.
     """
 
-    def __init__(self, data_dir, index_entries, stats):
-        self.data_dir = data_dir
-        self.index    = index_entries
-        self._handles = {}
-
+    def __init__(self, data_dir, index_entries, stats, log=print):
         w = stats["waves"]
         p = stats["parameters"]
 
-        self.wave_mean = torch.tensor(
-            [w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
-        ).unsqueeze(1)
-        self.wave_std = torch.tensor(
-            [w[k]["std"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
-        ).unsqueeze(1)
+        wave_mean = np.array([w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None]
+        wave_std  = np.array([w[k]["std"]  for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None] + 1e-8
 
-        self._pas_mean = w["Pas"]["mean"];  self._pas_std = w["Pas"]["std"] + 1e-8
-        self._vlv_std  = w["Vlv"]["std"] + 1e-8
-        self._hr_mean  = p["HR"]["mean"];   self._hr_std  = p["HR"]["std"] + 1e-8
+        pas_mean = w["Pas"]["mean"];  pas_std = w["Pas"]["std"] + 1e-8
+        vlv_std  = w["Vlv"]["std"] + 1e-8
+        hr_mean  = p["HR"]["mean"];   hr_std  = p["HR"]["std"] + 1e-8
+
+        n = len(index_entries)
+        theta_buf = np.empty((n, len(PARAM_KEYS_INFER)), dtype=np.float32)
+        x_buf     = np.empty((n, OBS_DIM),               dtype=np.float32)
+
+        handles = {}
+        log_interval = max(1, n // 20)
+        for i, entry in enumerate(index_entries):
+            path = os.path.join(data_dir, entry["file"])
+            if path not in handles:
+                handles[path] = h5py.File(path, "r")
+            g = handles[path][entry["group"]]
+
+            theta_raw = np.array([float(g[f"parameters/{k}"][()]) for k in PARAM_KEYS],
+                                 dtype=np.float32)
+            hr_raw = theta_raw[_HR_IDX]
+            theta_buf[i] = np.concatenate([theta_raw[:_HR_IDX], theta_raw[_HR_IDX + 1:]])
+
+            waves = np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_REDUCED]).astype(np.float32)
+            waves = (waves - wave_mean) / wave_std  # (4, 201)
+
+            pas   = g["waves/Pas"][:].astype(np.float32)
+            pas_z = (pas - pas_mean) / pas_std
+            vlv   = g["waves/Vlv"][:].astype(np.float32)
+            sv    = (vlv.max() - vlv.min()) / vlv_std
+            hr_z  = (hr_raw - hr_mean) / hr_std
+
+            x_buf[i, :N_REDUCED_CHANNELS * T] = waves.ravel()
+            x_buf[i, N_REDUCED_CHANNELS * T:] = [pas_z.mean(), pas_z.max(), pas_z.min(), sv, hr_z]
+
+            if (i + 1) % log_interval == 0 or i == n - 1:
+                log(f"  sims {i + 1}/{n} ({100*(i+1)//n}%)")
+
+        for fh in handles.values():
+            fh.close()
+
+        self.theta = torch.from_numpy(theta_buf)
+        self.x     = torch.from_numpy(x_buf)
 
     def __len__(self):
-        return len(self.index)
+        return len(self.theta)
 
     def __getitem__(self, idx):
-        entry = self.index[idx]
-        path  = os.path.join(self.data_dir, entry["file"])
-        if path not in self._handles:
-            self._handles[path] = h5py.File(path, "r")
-        g = self._handles[path][entry["group"]]
-
-        theta   = torch.tensor(
-            [float(g[f"parameters/{k}"][()]) for k in PARAM_KEYS], dtype=torch.float32
-        )
-        hr_raw      = theta[_HR_IDX].item()
-        theta_infer = torch.cat([theta[:_HR_IDX], theta[_HR_IDX + 1:]])  # (24,)
-
-        waves = torch.from_numpy(
-            np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_REDUCED]).astype(np.float32)
-        )
-        waves = (waves - self.wave_mean) / (self.wave_std + 1e-8)  # (4, 201)
-
-        pas_z = torch.from_numpy(g["waves/Pas"][:].astype(np.float32))
-        pas_z = (pas_z - self._pas_mean) / self._pas_std
-
-        vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
-        sv    = (vlv_z.max() - vlv_z.min()) / self._vlv_std
-
-        hr_z  = torch.tensor((hr_raw - self._hr_mean) / self._hr_std, dtype=torch.float32)
-
-        scalars = torch.stack([pas_z.mean(), pas_z.max(), pas_z.min(), sv, hr_z])  # (5,)
-        x = torch.cat([waves.reshape(-1), scalars])  # (809,)
-
-        return theta_infer, x
-
-    def close(self):
-        for fh in self._handles.values():
-            fh.close()
-        self._handles.clear()
+        return self.theta[idx], self.x[idx]
 
 
 class RealBeatsDataset(Dataset):
@@ -108,63 +108,50 @@ class RealBeatsDataset(Dataset):
 
     Each .h5 file = one patient; takes the first beat_* group.
     Same legacy normalization as ReducedCVDataset — shared sim-fitted affine map.
+    All 802 beats preloaded into RAM at init (~2.5 MB).
     """
 
-    def __init__(self, data_dir, stats):
+    def __init__(self, data_dir, stats, log=print):
         w = stats["waves"]
         p = stats["parameters"]
 
-        self.wave_mean = torch.tensor(
-            [w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
-        ).unsqueeze(1)
-        self.wave_std = torch.tensor(
-            [w[k]["std"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
-        ).unsqueeze(1)
+        wave_mean = np.array([w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None]
+        wave_std  = np.array([w[k]["std"]  for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None] + 1e-8
 
-        self._pas_mean = w["Pas"]["mean"];  self._pas_std = w["Pas"]["std"] + 1e-8
-        self._vlv_std  = w["Vlv"]["std"] + 1e-8
-        self._hr_mean  = p["HR"]["mean"];   self._hr_std  = p["HR"]["std"] + 1e-8
+        pas_mean = w["Pas"]["mean"];  pas_std = w["Pas"]["std"] + 1e-8
+        vlv_std  = w["Vlv"]["std"] + 1e-8
+        hr_mean  = p["HR"]["mean"];   hr_std  = p["HR"]["std"] + 1e-8
 
-        self.files = sorted(str(p) for p in __import__("pathlib").Path(data_dir).glob("*.h5"))
+        import pathlib
+        files = sorted(str(fp) for fp in pathlib.Path(data_dir).glob("*.h5"))
+        n = len(files)
+        x_buf = np.empty((n, OBS_DIM), dtype=np.float32)
+
+        for i, fpath in enumerate(files):
+            with h5py.File(fpath, "r") as f:
+                beat_keys = sorted(k for k in f.keys() if k.startswith("beat_"))
+                g = f[beat_keys[0]]
+
+                waves = np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_REDUCED]).astype(np.float32)
+                waves = (waves - wave_mean) / wave_std
+
+                map_z = (float(g["summaries/map"][()]) - pas_mean) / pas_std
+                sbp_z = (float(g["summaries/sbp"][()]) - pas_mean) / pas_std
+                dbp_z = (float(g["summaries/dbp"][()]) - pas_mean) / pas_std
+                sv_z  = float(g["summaries/sv"][()]) / vlv_std
+                hr_z  = (float(g["parameters/HR"][()]) - hr_mean) / hr_std
+
+                x_buf[i, :N_REDUCED_CHANNELS * T] = waves.ravel()
+                x_buf[i, N_REDUCED_CHANNELS * T:] = [map_z, sbp_z, dbp_z, sv_z, hr_z]
+
+        log(f"  loaded {n} real beats")
+        self.x = torch.from_numpy(x_buf)
 
     def __len__(self):
-        return len(self.files)
+        return len(self.x)
 
     def __getitem__(self, idx):
-        with h5py.File(self.files[idx], "r") as f:
-            beat_keys = sorted(k for k in f.keys() if k.startswith("beat_"))
-            g = f[beat_keys[0]]
-
-            waves = torch.from_numpy(
-                np.stack([g[f"waves/{k}"][:].astype(np.float32) for k in WAVE_KEYS_REDUCED])
-            )
-            waves = (waves - self.wave_mean) / (self.wave_std + 1e-8)
-
-            # Real files have pre-computed scalar summaries — apply same sim-fitted normalization
-            # so same physical value → same normalized point as in ReducedCVDataset.
-            map_z = torch.tensor(
-                (float(g["summaries/map"][()]) - self._pas_mean) / self._pas_std,
-                dtype=torch.float32,
-            )
-            sbp_z = torch.tensor(
-                (float(g["summaries/sbp"][()]) - self._pas_mean) / self._pas_std,
-                dtype=torch.float32,
-            )
-            dbp_z = torch.tensor(
-                (float(g["summaries/dbp"][()]) - self._pas_mean) / self._pas_std,
-                dtype=torch.float32,
-            )
-            sv_z  = torch.tensor(
-                float(g["summaries/sv"][()]) / self._vlv_std,
-                dtype=torch.float32,
-            )
-            hr_z  = torch.tensor(
-                (float(g["parameters/HR"][()]) - self._hr_mean) / self._hr_std,
-                dtype=torch.float32,
-            )
-
-            scalars = torch.stack([map_z, sbp_z, dbp_z, sv_z, hr_z])
-            return torch.cat([waves.reshape(-1), scalars])  # (809,)
+        return self.x[idx]
 
 
 def load_stats(stats_path="norm_stats.json"):

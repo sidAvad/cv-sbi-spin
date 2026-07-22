@@ -172,8 +172,18 @@ def main():
     run_dir = Path("outputs") / args.run
     log, log_fh = make_log(run_dir)
 
+    ts = f"{datetime.now():%Y%m%d-%H%M%S}"
     log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Run: {args.run}  v={args.version}")
     log(f"Device: {device}  max_epochs: {args.max_epochs}")
+
+    # Write run_info immediately so the command is captured even on crash
+    with open(run_dir / f"run_info_v{args.version}_{ts}.json", "w") as f:
+        json.dump({
+            "run": args.run, "version": args.version,
+            "status": "running",
+            "started": ts,
+            "command": " ".join(["train_spin.py"] + sys.argv[1:]),
+        }, f, indent=2)
 
     flow_end  = args.flow_warmup
     enc_end   = flow_end + args.enc_warmup
@@ -186,22 +196,23 @@ def main():
     manifest = load_manifest(sim_root / "manifest_train.json")
 
     log(f"Loading {args.n_sims} sim observations...")
-    sim_ds = ReducedCVDataset(str(sim_root / "train"), manifest["index"][:args.n_sims], stats)
+    sim_ds = ReducedCVDataset(str(sim_root / "train"), manifest["index"][:args.n_sims], stats,
+                              log=log)
     sim_dl = DataLoader(sim_ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=4, pin_memory=True, drop_last=True)
+                        num_workers=0, pin_memory=True, drop_last=True)
 
     log(f"Loading real patient beats from {args.real_data}...")
-    real_ds = RealBeatsDataset(args.real_data, stats)
+    real_ds = RealBeatsDataset(args.real_data, stats, log=log)
     # Oversample reals so each epoch sees ~as many real batches as sim batches
     real_sampler = RandomSampler(real_ds, replacement=True,
                                  num_samples=len(sim_ds))
     real_dl = DataLoader(real_ds, batch_size=args.batch_size, sampler=real_sampler,
-                         num_workers=2, pin_memory=True, drop_last=True)
+                         num_workers=0, pin_memory=True, drop_last=True)
     log(f"Real beats: {len(real_ds)}  (oversampled to ~{len(sim_ds)} per epoch)")
 
-    # Collect theta stats for flow z-scoring
+    # Theta stats for flow z-scoring — data already in RAM, just slice
     log("Collecting theta stats for flow...")
-    theta_all = torch.stack([sim_ds[i][0] for i in range(min(10_000, len(sim_ds)))])
+    theta_all = sim_ds.theta[:min(10_000, len(sim_ds))]
 
     # ── Models ────────────────────────────────────────────────────────────────
     encoder = LipschitzEncoder(latent_dim=args.latent_dim).to(device)
@@ -326,35 +337,36 @@ def main():
     torch.save(G_rs.state_dict(),     run_dir / "G_rs.pt")
     log(f"Saved checkpoints to {run_dir}")
 
-    # ── run_info ──────────────────────────────────────────────────────────────
+    # ── run_info (overwrite with full info on completion) ─────────────────────
     import subprocess
     try:
         git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
                                            text=True, stderr=subprocess.DEVNULL).strip()
     except subprocess.CalledProcessError:
         git_hash = "unknown"
-    run_info = {
-        "run": args.run, "version": args.version,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "git_hash": git_hash,
-        "command": " ".join(["train_spin.py"] + sys.argv[1:]),
-        "device": str(device),
-        "schedule": {
-            "flow_end": flow_end, "enc_end": enc_end,
-            "joint_start": joint_start, "max_epochs": args.max_epochs,
-            "info_ramp": args.info_ramp,
-        },
-        "losses": {
-            "lam_cyc": args.lam_cyc, "lam_id": args.lam_id,
-            "lam_info_max": args.lam_info_max,
-        },
-        "data": {
-            "n_sims": args.n_sims, "n_real_beats": len(real_ds),
-            "sim_data_root": args.sim_data_root, "real_data": args.real_data,
-        },
-    }
-    with open(run_dir / f"run_info_v{args.version}.json", "w") as f:
-        json.dump(run_info, f, indent=2)
+    with open(run_dir / f"run_info_v{args.version}_{ts}.json", "w") as f:
+        json.dump({
+            "run": args.run, "version": args.version,
+            "status": "done",
+            "started": ts,
+            "finished": f"{datetime.now():%Y%m%d-%H%M%S}",
+            "command": " ".join(["train_spin.py"] + sys.argv[1:]),
+            "git_hash": git_hash,
+            "device": str(device),
+            "schedule": {
+                "flow_end": flow_end, "enc_end": enc_end,
+                "joint_start": joint_start, "max_epochs": args.max_epochs,
+                "info_ramp": args.info_ramp,
+            },
+            "losses": {
+                "lam_cyc": args.lam_cyc, "lam_id": args.lam_id,
+                "lam_info_max": args.lam_info_max,
+            },
+            "data": {
+                "n_sims": args.n_sims, "n_real_beats": len(real_ds),
+                "sim_data_root": args.sim_data_root, "real_data": args.real_data,
+            },
+        }, f, indent=2)
     log("Done.")
     log_fh.close()
     csv_fh.close()
