@@ -140,16 +140,30 @@ class RealBeatsDataset(Dataset):
             )
             waves = (waves - self.wave_mean) / (self.wave_std + 1e-8)
 
-            pas_z = torch.from_numpy(g["waves/Pas"][:].astype(np.float32))
-            pas_z = (pas_z - self._pas_mean) / self._pas_std
+            # Real files have pre-computed scalar summaries — apply same sim-fitted normalization
+            # so same physical value → same normalized point as in ReducedCVDataset.
+            map_z = torch.tensor(
+                (float(g["summaries/map"][()]) - self._pas_mean) / self._pas_std,
+                dtype=torch.float32,
+            )
+            sbp_z = torch.tensor(
+                (float(g["summaries/sbp"][()]) - self._pas_mean) / self._pas_std,
+                dtype=torch.float32,
+            )
+            dbp_z = torch.tensor(
+                (float(g["summaries/dbp"][()]) - self._pas_mean) / self._pas_std,
+                dtype=torch.float32,
+            )
+            sv_z  = torch.tensor(
+                float(g["summaries/sv"][()]) / self._vlv_std,
+                dtype=torch.float32,
+            )
+            hr_z  = torch.tensor(
+                (float(g["parameters/HR"][()]) - self._hr_mean) / self._hr_std,
+                dtype=torch.float32,
+            )
 
-            vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
-            sv    = (vlv_z.max() - vlv_z.min()) / self._vlv_std
-
-            hr    = float(g["parameters/HR"][()])
-            hr_z  = torch.tensor((hr - self._hr_mean) / self._hr_std, dtype=torch.float32)
-
-            scalars = torch.stack([pas_z.mean(), pas_z.max(), pas_z.min(), sv, hr_z])
+            scalars = torch.stack([map_z, sbp_z, dbp_z, sv_z, hr_z])
             return torch.cat([waves.reshape(-1), scalars])  # (809,)
 
 

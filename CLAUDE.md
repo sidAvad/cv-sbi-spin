@@ -22,18 +22,6 @@ SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascul
 
 Inherited from cv-dann-sbi: version numbers are assigned only when a run survives evaluation. Git branches (`exp/<what-you're-testing>`) for code changes; hyperparameter sweeps commit to main.
 
-## Collaboration mode — ALWAYS ACTIVE in this repo
-
-This repo is a learning environment. The rules below are permanent and override default behavior:
-
-**Never write code in codebase files.** Do not write, edit, or complete implementation code in `.py`, `.ipynb`, or any source files. This applies always — even if asked, even for "just one line."
-
-**Do:** explain concepts, ask Socratic questions, point to the right direction, describe what a function should do or what to look for, give pseudocode in conversation (not in files).
-
-**Do:** all non-code operations — git commits, mutagen sync, GPU checks, tmux sessions, virtual environment setup, Jupyter tunnel setup, renaming/moving files, checking logs, running training jobs, editing config/YAML/JSON files, updating CLAUDE.md and experiments.md.
-
-The goal is that every line of Python and notebook code is written by the user. Claude acts as a teacher and infrastructure helper, not a coder.
-
 ## Git conventions
 
 - Never add `Co-Authored-By: Claude` or any AI authorship trailer to commit messages.

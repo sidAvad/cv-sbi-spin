@@ -328,8 +328,11 @@ def main():
 
     # ── run_info ──────────────────────────────────────────────────────────────
     import subprocess
-    git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
-                                       text=True).strip()
+    try:
+        git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                           text=True, stderr=subprocess.DEVNULL).strip()
+    except subprocess.CalledProcessError:
+        git_hash = "unknown"
     run_info = {
         "run": args.run, "version": args.version,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
