@@ -1,0 +1,321 @@
+"""
+SPIN training: sim↔real dual generators + information-preserving posterior.
+
+Schedule (per spec §3):
+  Phase 0  flow-warmup   (ep 1–2)    flow trains, encoder frozen, G/D idle
+  Phase 1  enc-warmup    (ep 3–12)   encoder trains, flow frozen, G/D idle
+  Phase 2  joint         (ep 13+)    per-batch: generator step → discriminator step → posterior step
+
+Per-batch step order (joint phase only, §2):
+  1. Generator step   — update G_sr, G_rs       (encoder/flow as fixed functions, not detached)
+  2. Discriminator step — update D_R, D_S       (generator outputs detached)
+  3. Posterior step   — update h_ω, q_ψ         (x_srs detached, no grad into G)
+
+Optimizers:
+  opt_G   : Adam(G_sr + G_rs,   lr=2e-4, betas=(0.5, 0.999))
+  opt_D   : Adam(D_R  + D_S,    lr=2e-4, betas=(0.5, 0.999))
+  opt_NPE : AdamW(encoder + flow, lr=1e-4)
+"""
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, RandomSampler
+
+sys.path.insert(0, str(Path(__file__).parent))
+from dataset import (
+    ReducedCVDataset, RealBeatsDataset,
+    load_stats, load_manifest,
+    PARAM_KEYS_INFER,
+)
+from models import (
+    LipschitzEncoder, build_flow_net,
+    DualBranchGenerator, DualBranchDiscriminator,
+)
+
+
+# ── Losses ────────────────────────────────────────────────────────────────────
+
+def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, encoder, flow, lam_cyc, lam_id, lam_info):
+    """
+    Generator step: update G_sr and G_rs.
+    encoder + flow used as fixed functions (gradients flow through them to G, but their
+    weights are not in opt_G — so they update only via opt_NPE).
+
+    Returns scalar loss and a dict of components for logging.
+    """
+    # TODO: implement adversarial + cycle + identity + info losses (spec §1a–§1d)
+    raise NotImplementedError
+
+
+def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r):
+    """
+    Discriminator step: update D_R and D_S.
+    Generator outputs must be detached before feeding discriminators.
+
+    Hinge loss (spec §1a):
+      L_D_R = relu(1 - D_R(x_r)).mean() + relu(1 + D_R(x_sr.detach())).mean()
+      L_D_S = relu(1 - D_S(x_s)).mean() + relu(1 + D_S(x_rs.detach())).mean()
+
+    Returns scalar loss and a dict of components for logging.
+    """
+    # TODO
+    raise NotImplementedError
+
+
+def loss_posterior(encoder, flow, x_s, theta, x_srs_detached, lam_info):
+    """
+    Posterior step: update h_ω and q_ψ.
+    x_srs must already be detached (no grad into G from this step).
+
+    L_NPE = -log q_ψ(θ | h_ω(x_s)) + lam_info * (-log q_ψ(θ | h_ω(x_srs_detached)))
+
+    Returns scalar loss and a dict of components for logging.
+    """
+    # TODO
+    raise NotImplementedError
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def lambda_info_schedule(epoch, joint_start, joint_end, ramp_epochs=50):
+    """Linear ramp from 0 → 1 over first ramp_epochs of joint phase."""
+    joint_ep = epoch - joint_start
+    return min(1.0, joint_ep / ramp_epochs)
+
+
+def make_log(run_dir: Path):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = run_dir / f"train_{ts}.log"
+    fh = open(log_path, "w")
+
+    def log(msg):
+        print(msg, flush=True)
+        fh.write(msg + "\n")
+        fh.flush()
+
+    return log, fh
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run",          required=True)
+    parser.add_argument("--version",      default="1")
+    parser.add_argument("--sim-data-root", required=True)
+    parser.add_argument("--real-data",    required=True)
+    parser.add_argument("--n-sims",       type=int, required=True)
+    parser.add_argument("--max-epochs",   type=int, default=400)
+    parser.add_argument("--flow-warmup",  type=int, default=2)
+    parser.add_argument("--enc-warmup",   type=int, default=10)
+    parser.add_argument("--lam-cyc",      type=float, default=10.0)
+    parser.add_argument("--lam-id",       type=float, default=5.0)
+    parser.add_argument("--lam-info-max", type=float, default=1.0)
+    parser.add_argument("--info-ramp",    type=int,   default=50,
+                        help="Joint epochs over which lambda_info ramps 0→lam_info_max")
+    parser.add_argument("--batch-size",   type=int, default=512)
+    parser.add_argument("--lr-npe",       type=float, default=1e-4)
+    parser.add_argument("--lr-gan",       type=float, default=2e-4)
+    parser.add_argument("--latent-dim",   type=int, default=128)
+    parser.add_argument("--stats-path",   default="norm_stats.json")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    run_dir = Path("outputs") / args.run
+    log, log_fh = make_log(run_dir)
+
+    log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Run: {args.run}  v={args.version}")
+    log(f"Device: {device}  max_epochs: {args.max_epochs}")
+
+    flow_end  = args.flow_warmup
+    enc_end   = flow_end + args.enc_warmup
+    joint_start = enc_end + 1
+    log(f"Phase boundaries — flow_end={flow_end}  enc_end={enc_end}  joint_start={joint_start}")
+
+    # ── Data ──────────────────────────────────────────────────────────────────
+    stats    = load_stats(args.stats_path)
+    sim_root = Path(args.sim_data_root)
+    manifest = load_manifest(sim_root / "manifest_train.json")
+
+    log(f"Loading {args.n_sims} sim observations...")
+    sim_ds = ReducedCVDataset(str(sim_root / "train"), manifest["index"][:args.n_sims], stats)
+    sim_dl = DataLoader(sim_ds, batch_size=args.batch_size, shuffle=True,
+                        num_workers=4, pin_memory=True, drop_last=True)
+
+    log(f"Loading real patient beats from {args.real_data}...")
+    real_ds = RealBeatsDataset(args.real_data, stats)
+    # Oversample reals so each epoch sees ~as many real batches as sim batches
+    real_sampler = RandomSampler(real_ds, replacement=True,
+                                 num_samples=len(sim_ds))
+    real_dl = DataLoader(real_ds, batch_size=args.batch_size, sampler=real_sampler,
+                         num_workers=2, pin_memory=True, drop_last=True)
+    log(f"Real beats: {len(real_ds)}  (oversampled to ~{len(sim_ds)} per epoch)")
+
+    # Collect theta stats for flow z-scoring
+    log("Collecting theta stats for flow...")
+    theta_all = torch.stack([sim_ds[i][0] for i in range(min(10_000, len(sim_ds)))])
+
+    # ── Models ────────────────────────────────────────────────────────────────
+    encoder = LipschitzEncoder(latent_dim=args.latent_dim).to(device)
+    flow    = build_flow_net(args.latent_dim, theta_all).to(device)
+    G_sr    = DualBranchGenerator().to(device)
+    G_rs    = DualBranchGenerator().to(device)
+    D_R     = DualBranchDiscriminator().to(device)
+    D_S     = DualBranchDiscriminator().to(device)
+
+    log(f"Encoder params:    {sum(p.numel() for p in encoder.parameters()):,}")
+    log(f"G_sr/G_rs params:  {sum(p.numel() for p in G_sr.parameters()):,} each")
+    log(f"D_R/D_S params:    {sum(p.numel() for p in D_R.parameters()):,} each")
+
+    # ── Optimizers ────────────────────────────────────────────────────────────
+    opt_G   = torch.optim.Adam(
+        list(G_sr.parameters()) + list(G_rs.parameters()),
+        lr=args.lr_gan, betas=(0.5, 0.999),
+    )
+    opt_D   = torch.optim.Adam(
+        list(D_R.parameters()) + list(D_S.parameters()),
+        lr=args.lr_gan, betas=(0.5, 0.999),
+    )
+    opt_NPE = torch.optim.AdamW(
+        list(encoder.parameters()) + list(flow.parameters()),
+        lr=args.lr_npe,
+    )
+
+    # ── CSV logger ────────────────────────────────────────────────────────────
+    csv_path = run_dir / f"train_log_{datetime.now():%Y%m%d-%H%M%S}.csv"
+    csv_fh   = open(csv_path, "w")
+    csv_fh.write("epoch,phase,npe_sim,npe_srs,loss_G,loss_D,lam_info\n")
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    for epoch in range(1, args.max_epochs + 1):
+
+        if   epoch <= flow_end:  phase = "flow-warmup"
+        elif epoch <= enc_end:   phase = "enc-warmup"
+        else:                    phase = "joint"
+
+        lam_info = (lambda_info_schedule(epoch, joint_start, args.max_epochs, args.info_ramp)
+                    * args.lam_info_max if phase == "joint" else 0.0)
+
+        # Freeze / unfreeze
+        for p in encoder.parameters(): p.requires_grad = (phase != "flow-warmup")
+        for p in flow.parameters():    p.requires_grad = (phase != "enc-warmup")
+        for p in G_sr.parameters():    p.requires_grad = (phase == "joint")
+        for p in G_rs.parameters():    p.requires_grad = (phase == "joint")
+        for p in D_R.parameters():     p.requires_grad = (phase == "joint")
+        for p in D_S.parameters():     p.requires_grad = (phase == "joint")
+
+        enc_npe_sum = G_loss_sum = D_loss_sum = npe_srs_sum = 0.0
+        n_batches = 0
+
+        real_iter = iter(real_dl)
+
+        for theta, x_s in sim_dl:
+            theta = theta.to(device)
+            x_s   = x_s.to(device)
+
+            try:
+                x_r = next(real_iter).to(device)
+            except StopIteration:
+                real_iter = iter(real_dl)
+                x_r = next(real_iter).to(device)
+
+            # ── 1. Generator step (joint only) ────────────────────────────
+            if phase == "joint":
+                opt_G.zero_grad()
+                G_loss, G_info = loss_generator(
+                    G_sr, G_rs, D_R, D_S, x_s, x_r,
+                    encoder, flow, args.lam_cyc, args.lam_id, lam_info,
+                )
+                G_loss.backward()
+                opt_G.step()
+                G_loss_sum += G_loss.item()
+
+            # ── 2. Discriminator step (joint only) ────────────────────────
+            if phase == "joint":
+                opt_D.zero_grad()
+                D_loss, D_info = loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r)
+                D_loss.backward()
+                opt_D.step()
+                D_loss_sum += D_loss.item()
+
+            # ── 3. Posterior step (all phases) ────────────────────────────
+            opt_NPE.zero_grad()
+
+            # Build x_srs detached (no grad into G from posterior step)
+            if phase == "joint":
+                with torch.no_grad():
+                    x_srs_detached = G_rs(G_sr(x_s))
+            else:
+                x_srs_detached = None
+
+            NPE_loss, NPE_info = loss_posterior(
+                encoder, flow, x_s, theta, x_srs_detached, lam_info,
+            )
+            NPE_loss.backward()
+            opt_NPE.step()
+
+            enc_npe_sum  += NPE_info.get("npe_sim", 0.0)
+            npe_srs_sum  += NPE_info.get("npe_srs", 0.0)
+            n_batches    += 1
+
+        # ── Epoch logging ─────────────────────────────────────────────────
+        npe_sim  = enc_npe_sum  / n_batches
+        npe_srs  = npe_srs_sum  / n_batches
+        G_loss_e = G_loss_sum   / max(n_batches, 1)
+        D_loss_e = D_loss_sum   / max(n_batches, 1)
+
+        log(f"  ep {epoch:3d}/{args.max_epochs}  [{phase}]"
+            f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}"
+            f"  G={G_loss_e:.4f}  D={D_loss_e:.4f}  λ_info={lam_info:.3f}")
+        csv_fh.write(f"{epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},"
+                     f"{G_loss_e:.6f},{D_loss_e:.6f},{lam_info:.4f}\n")
+        csv_fh.flush()
+
+    # ── Save checkpoints ──────────────────────────────────────────────────────
+    torch.save(encoder.state_dict(), run_dir / "encoder.pt")
+    torch.save(flow,                  run_dir / "flow_net.pt")
+    torch.save(G_sr.state_dict(),     run_dir / "G_sr.pt")
+    torch.save(G_rs.state_dict(),     run_dir / "G_rs.pt")
+    log(f"Saved checkpoints to {run_dir}")
+
+    # ── run_info ──────────────────────────────────────────────────────────────
+    import subprocess
+    git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       text=True).strip()
+    run_info = {
+        "run": args.run, "version": args.version,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "git_hash": git_hash,
+        "command": " ".join(["train_spin.py"] + sys.argv[1:]),
+        "device": str(device),
+        "schedule": {
+            "flow_end": flow_end, "enc_end": enc_end,
+            "joint_start": joint_start, "max_epochs": args.max_epochs,
+            "info_ramp": args.info_ramp,
+        },
+        "losses": {
+            "lam_cyc": args.lam_cyc, "lam_id": args.lam_id,
+            "lam_info_max": args.lam_info_max,
+        },
+        "data": {
+            "n_sims": args.n_sims, "n_real_beats": len(real_ds),
+            "sim_data_root": args.sim_data_root, "real_data": args.real_data,
+        },
+    }
+    with open(run_dir / f"run_info_v{args.version}.json", "w") as f:
+        json.dump(run_info, f, indent=2)
+    log("Done.")
+    log_fh.close()
+    csv_fh.close()
+
+
+if __name__ == "__main__":
+    main()
