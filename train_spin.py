@@ -41,16 +41,45 @@ from models import (
 
 # ── Losses ────────────────────────────────────────────────────────────────────
 
-def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, encoder, flow, lam_cyc, lam_id, lam_info):
+def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
+                   encoder, flow, lam_cyc, lam_id, lam_info, lam_adv=1.0):
     """
     Generator step: update G_sr and G_rs.
-    encoder + flow used as fixed functions (gradients flow through them to G, but their
-    weights are not in opt_G — so they update only via opt_NPE).
 
-    Returns scalar loss and a dict of components for logging.
+    encoder + flow are used as fixed functions — gradients flow THROUGH them back to
+    G_sr/G_rs (no .detach()), but their weights are not in opt_G so they don't update
+    here. They update only via opt_NPE in the posterior step.
+
+    L_G = lam_adv * L_adv + lam_cyc * L_cyc + lam_id * L_id + lam_info * L_info
     """
-    # TODO: implement adversarial + cycle + identity + info losses (spec §1a–§1d)
-    raise NotImplementedError
+    # Forward passes
+    x_sr  = G_sr(x_s)       # sim → real
+    x_rs  = G_rs(x_r)       # real → sim
+    x_srs = G_rs(x_sr)      # sim → real → sim  (round trip, spec §1b + §1d)
+    x_rsr = G_sr(x_rs)      # real → sim → real (round trip, spec §1b)
+
+    # Adversarial — generators push discriminators toward positive (spec §1a)
+    L_adv = -D_R(x_sr).mean() - D_S(x_rs).mean()
+
+    # Cycle consistency — L1 on both round trips (spec §1b)
+    L_cyc = (x_srs - x_s).abs().mean() + (x_rsr - x_r).abs().mean()
+
+    # Identity — each generator should be near-identity on its target domain (spec §1c)
+    L_id = (G_rs(x_s) - x_s).abs().mean() + (G_sr(x_r) - x_r).abs().mean()
+
+    # Information preservation — sim→real→sim only, no .detach() on encoder/flow (spec §1d)
+    if lam_info > 0:
+        L_info = -flow.log_prob(theta, condition=encoder(x_srs)).mean()
+    else:
+        L_info = torch.zeros(1, device=x_s.device).squeeze()
+
+    loss = lam_adv * L_adv + lam_cyc * L_cyc + lam_id * L_id + lam_info * L_info
+    return loss, {
+        "adv":  L_adv.item(),
+        "cyc":  L_cyc.item(),
+        "id":   L_id.item(),
+        "info": L_info.item(),
+    }
 
 
 def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r):
@@ -242,7 +271,7 @@ def main():
             if phase == "joint":
                 opt_G.zero_grad()
                 G_loss, G_info = loss_generator(
-                    G_sr, G_rs, D_R, D_S, x_s, x_r,
+                    G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
                     encoder, flow, args.lam_cyc, args.lam_id, lam_info,
                 )
                 G_loss.backward()
