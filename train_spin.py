@@ -165,6 +165,10 @@ def main():
     parser.add_argument("--lr-gan",       type=float, default=2e-4)
     parser.add_argument("--latent-dim",   type=int, default=128)
     parser.add_argument("--stats-path",   default="norm_stats.json")
+    parser.add_argument("--resume",       action="store_true",
+                        help="Load existing checkpoints from run_dir and continue training")
+    parser.add_argument("--start-epoch",  type=int, default=1,
+                        help="Epoch offset for display and lambda schedule (set to prev max_epochs+1 when resuming)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -222,6 +226,13 @@ def main():
     D_R     = DualBranchDiscriminator().to(device)
     D_S     = DualBranchDiscriminator().to(device)
 
+    if args.resume:
+        encoder.load_state_dict(torch.load(run_dir / "encoder.pt", map_location=device, weights_only=True))
+        flow    = torch.load(run_dir / "flow_net.pt", map_location=device, weights_only=False)
+        G_sr.load_state_dict(torch.load(run_dir / "G_sr.pt", map_location=device, weights_only=True))
+        G_rs.load_state_dict(torch.load(run_dir / "G_rs.pt", map_location=device, weights_only=True))
+        log(f"Resumed from checkpoints in {run_dir}")
+
     log(f"Encoder params:    {sum(p.numel() for p in encoder.parameters()):,}")
     log(f"G_sr/G_rs params:  {sum(p.numel() for p in G_sr.parameters()):,} each")
     log(f"D_R/D_S params:    {sum(p.numel() for p in D_R.parameters()):,} each")
@@ -241,18 +252,26 @@ def main():
     )
 
     # ── CSV logger ────────────────────────────────────────────────────────────
-    csv_path = run_dir / f"train_log_{datetime.now():%Y%m%d-%H%M%S}.csv"
-    csv_fh   = open(csv_path, "w")
-    csv_fh.write("epoch,phase,npe_sim,npe_srs,loss_G,loss_D,lam_info\n")
+    if args.resume:
+        # Append to the most recent existing CSV
+        existing = sorted(run_dir.glob("train_log_*.csv"))
+        csv_path = existing[-1] if existing else run_dir / f"train_log_{ts}.csv"
+        csv_fh   = open(csv_path, "a")
+    else:
+        csv_path = run_dir / f"train_log_{ts}.csv"
+        csv_fh   = open(csv_path, "w")
+        csv_fh.write("epoch,phase,npe_sim,npe_srs,loss_G,loss_D,lam_info\n")
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    end_epoch = args.start_epoch + args.max_epochs - 1
     for epoch in range(1, args.max_epochs + 1):
+        abs_epoch = args.start_epoch + epoch - 1
 
-        if   epoch <= flow_end:  phase = "flow-warmup"
-        elif epoch <= enc_end:   phase = "enc-warmup"
-        else:                    phase = "joint"
+        if   abs_epoch <= flow_end:  phase = "flow-warmup"
+        elif abs_epoch <= enc_end:   phase = "enc-warmup"
+        else:                        phase = "joint"
 
-        lam_info = (lambda_info_schedule(epoch, joint_start, args.max_epochs, args.info_ramp)
+        lam_info = (lambda_info_schedule(abs_epoch, joint_start, end_epoch, args.info_ramp)
                     * args.lam_info_max if phase == "joint" else 0.0)
 
         # Freeze / unfreeze
@@ -323,10 +342,10 @@ def main():
         G_loss_e = G_loss_sum   / max(n_batches, 1)
         D_loss_e = D_loss_sum   / max(n_batches, 1)
 
-        log(f"  ep {epoch:3d}/{args.max_epochs}  [{phase}]"
+        log(f"  ep {abs_epoch:3d}/{end_epoch}  [{phase}]"
             f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}"
             f"  G={G_loss_e:.4f}  D={D_loss_e:.4f}  λ_info={lam_info:.3f}")
-        csv_fh.write(f"{epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},"
+        csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},"
                      f"{G_loss_e:.6f},{D_loss_e:.6f},{lam_info:.4f}\n")
         csv_fh.flush()
 
