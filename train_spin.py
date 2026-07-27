@@ -31,8 +31,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dataset import (
     ReducedCVDataset, RealBeatsDataset,
     load_stats, load_manifest,
-    PARAM_KEYS_INFER,
+    PARAM_KEYS_INFER, N_REDUCED_CHANNELS, T,
 )
+
+_WAVE_DIM = N_REDUCED_CHANNELS * T  # 804
 from models import (
     LipschitzEncoder, build_flow_net,
     DualBranchGenerator, DualBranchDiscriminator,
@@ -74,11 +76,19 @@ def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
         L_info = torch.zeros(1, device=x_s.device).squeeze()
 
     loss = lam_adv * L_adv + lam_cyc * L_cyc + lam_id * L_id + lam_info * L_info
+
+    with torch.no_grad():
+        delta   = (x_sr - x_s).abs()
+        delta_w = delta[:, :_WAVE_DIM].mean().item()
+        delta_s = delta[:, _WAVE_DIM:].mean().item()
+
     return loss, {
-        "adv":  L_adv.item(),
-        "cyc":  L_cyc.item(),
-        "id":   L_id.item(),
-        "info": L_info.item(),
+        "adv":     L_adv.item(),
+        "cyc":     L_cyc.item(),
+        "id":      L_id.item(),
+        "info":    L_info.item(),
+        "delta_w": delta_w,
+        "delta_s": delta_s,
     }
 
 
@@ -260,7 +270,8 @@ def main():
     else:
         csv_path = run_dir / f"train_log_{ts}.csv"
         csv_fh   = open(csv_path, "w")
-        csv_fh.write("epoch,phase,npe_sim,npe_srs,loss_G,loss_D,lam_info\n")
+        csv_fh.write("epoch,phase,npe_sim,npe_srs,gap,L_adv,L_cyc,L_id,L_info_G,"
+                     "loss_G,L_D_R,L_D_S,loss_D,delta_waves,delta_scal,lam_info\n")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     end_epoch = args.start_epoch + args.max_epochs - 1
@@ -283,6 +294,8 @@ def main():
         for p in D_S.parameters():     p.requires_grad = (phase == "joint")
 
         enc_npe_sum = G_loss_sum = D_loss_sum = npe_srs_sum = 0.0
+        adv_sum = cyc_sum = id_sum = info_g_sum = 0.0
+        D_R_sum = D_S_sum = dw_sum = ds_sum = 0.0
         n_batches = 0
 
         real_iter = iter(real_dl)
@@ -306,7 +319,13 @@ def main():
                 )
                 G_loss.backward()
                 opt_G.step()
-                G_loss_sum += G_loss.item()
+                G_loss_sum  += G_loss.item()
+                adv_sum     += G_info["adv"]
+                cyc_sum     += G_info["cyc"]
+                id_sum      += G_info["id"]
+                info_g_sum  += G_info["info"]
+                dw_sum      += G_info["delta_w"]
+                ds_sum      += G_info["delta_s"]
 
             # ── 2. Discriminator step (joint only) ────────────────────────
             if phase == "joint":
@@ -315,6 +334,8 @@ def main():
                 D_loss.backward()
                 opt_D.step()
                 D_loss_sum += D_loss.item()
+                D_R_sum    += D_info["D_R"]
+                D_S_sum    += D_info["D_S"]
 
             # ── 3. Posterior step (all phases) ────────────────────────────
             opt_NPE.zero_grad()
@@ -337,16 +358,30 @@ def main():
             n_batches    += 1
 
         # ── Epoch logging ─────────────────────────────────────────────────
-        npe_sim  = enc_npe_sum  / n_batches
-        npe_srs  = npe_srs_sum  / n_batches
-        G_loss_e = G_loss_sum   / max(n_batches, 1)
-        D_loss_e = D_loss_sum   / max(n_batches, 1)
+        nb = max(n_batches, 1)
+        npe_sim  = enc_npe_sum / n_batches
+        npe_srs  = npe_srs_sum / n_batches
+        gap      = npe_srs - npe_sim
+        G_loss_e = G_loss_sum  / nb
+        D_loss_e = D_loss_sum  / nb
+        adv_e    = adv_sum     / nb
+        cyc_e    = cyc_sum     / nb
+        id_e     = id_sum      / nb
+        info_g_e = info_g_sum  / nb
+        D_R_e    = D_R_sum     / nb
+        D_S_e    = D_S_sum     / nb
+        dw_e     = dw_sum      / nb
+        ds_e     = ds_sum      / nb
 
         log(f"  ep {abs_epoch:3d}/{end_epoch}  [{phase}]"
-            f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}"
-            f"  G={G_loss_e:.4f}  D={D_loss_e:.4f}  λ_info={lam_info:.3f}")
-        csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},"
-                     f"{G_loss_e:.6f},{D_loss_e:.6f},{lam_info:.4f}\n")
+            f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}  gap={gap:+.4f}"
+            f"  L_adv={adv_e:.4f}  L_cyc={cyc_e:.4f}  L_id={id_e:.4f}  L_info={info_g_e:.4f}"
+            f"  L_D_R={D_R_e:.4f}  L_D_S={D_S_e:.4f}"
+            f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}")
+        csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},{gap:.6f},"
+                     f"{adv_e:.6f},{cyc_e:.6f},{id_e:.6f},{info_g_e:.6f},{G_loss_e:.6f},"
+                     f"{D_R_e:.6f},{D_S_e:.6f},{D_loss_e:.6f},"
+                     f"{dw_e:.6f},{ds_e:.6f},{lam_info:.4f}\n")
         csv_fh.flush()
 
     # ── Save checkpoints ──────────────────────────────────────────────────────
