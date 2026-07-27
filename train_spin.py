@@ -44,7 +44,8 @@ from models import (
 # ── Losses ────────────────────────────────────────────────────────────────────
 
 def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
-                   encoder, flow, lam_cyc, lam_id, lam_info, lam_adv=1.0):
+                   encoder, flow, lam_cyc, lam_id, lam_info, lam_adv=1.0,
+                   wave_only=False, clamp_info_gap=False):
     """
     Generator step: update G_sr and G_rs.
 
@@ -52,26 +53,49 @@ def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
     G_sr/G_rs (no .detach()), but their weights are not in opt_G so they don't update
     here. They update only via opt_NPE in the posterior step.
 
+    wave_only: generators receive/return waves only (804-dim); scalars are passed through
+               unchanged and concatenated back before encoder/discriminator calls.
+    clamp_info_gap: L_info = relu(npe_srs - npe_sim) instead of npe_srs — gradient to
+                    generator only when translated reals are harder than pure sims.
+
     L_G = lam_adv * L_adv + lam_cyc * L_cyc + lam_id * L_id + lam_info * L_info
     """
+    def _gen(G, x):
+        """Apply generator, routing scalars around it when wave_only."""
+        if wave_only:
+            waves_out = G(x[:, :_WAVE_DIM])
+            return torch.cat([waves_out, x[:, _WAVE_DIM:]], dim=1)
+        return G(x)
+
+    def _disc(D, x):
+        """Call discriminator on waves only when wave_only."""
+        return D(x[:, :_WAVE_DIM]) if wave_only else D(x)
+
     # Forward passes
-    x_sr  = G_sr(x_s)       # sim → real
-    x_rs  = G_rs(x_r)       # real → sim
-    x_srs = G_rs(x_sr)      # sim → real → sim  (round trip, spec §1b + §1d)
-    x_rsr = G_sr(x_rs)      # real → sim → real (round trip, spec §1b)
+    x_sr  = _gen(G_sr, x_s)   # sim → real
+    x_rs  = _gen(G_rs, x_r)   # real → sim
+    x_srs = _gen(G_rs, x_sr)  # sim → real → sim  (round trip, spec §1b + §1d)
+    x_rsr = _gen(G_sr, x_rs)  # real → sim → real (round trip, spec §1b)
 
     # Adversarial — generators push discriminators toward positive (spec §1a)
-    L_adv = -D_R(x_sr).mean() - D_S(x_rs).mean()
+    L_adv = -_disc(D_R, x_sr).mean() - _disc(D_S, x_rs).mean()
 
     # Cycle consistency — L1 on both round trips (spec §1b)
     L_cyc = (x_srs - x_s).abs().mean() + (x_rsr - x_r).abs().mean()
 
     # Identity — each generator should be near-identity on its target domain (spec §1c)
-    L_id = (G_rs(x_s) - x_s).abs().mean() + (G_sr(x_r) - x_r).abs().mean()
+    L_id = (_gen(G_rs, x_s) - x_s).abs().mean() + (_gen(G_sr, x_r) - x_r).abs().mean()
 
     # Information preservation — sim→real→sim only, no .detach() on encoder/flow (spec §1d)
     if lam_info > 0:
-        L_info = -flow.log_prob(theta, condition=encoder(x_srs)).mean()
+        npe_srs = -flow.log_prob(theta, condition=encoder(x_srs)).mean()
+        if clamp_info_gap:
+            # gradient only when translated reals are harder than sims
+            with torch.no_grad():
+                npe_sim_ref = -flow.log_prob(theta, condition=encoder(x_s)).mean()
+            L_info = torch.relu(npe_srs - npe_sim_ref)
+        else:
+            L_info = npe_srs
     else:
         L_info = torch.zeros(1, device=x_s.device).squeeze()
 
@@ -92,7 +116,7 @@ def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
     }
 
 
-def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r):
+def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r, wave_only=False):
     """
     Discriminator step: update D_R and D_S.
 
@@ -100,13 +124,21 @@ def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r):
       L_D_R = relu(1 - D_R(x_r)).mean() + relu(1 + D_R(x_sr.detach())).mean()
       L_D_S = relu(1 - D_S(x_s)).mean() + relu(1 + D_S(x_rs.detach())).mean()
     """
-    x_sr = G_sr(x_s).detach()
-    x_rs = G_rs(x_r).detach()
+    def _gen(G, x):
+        if wave_only:
+            return torch.cat([G(x[:, :_WAVE_DIM]), x[:, _WAVE_DIM:]], dim=1)
+        return G(x)
 
-    L_D_R = (torch.relu(1 - D_R(x_r)).mean()
-           + torch.relu(1 + D_R(x_sr)).mean())
-    L_D_S = (torch.relu(1 - D_S(x_s)).mean()
-           + torch.relu(1 + D_S(x_rs)).mean())
+    def _disc(D, x):
+        return D(x[:, :_WAVE_DIM]) if wave_only else D(x)
+
+    x_sr = _gen(G_sr, x_s).detach()
+    x_rs = _gen(G_rs, x_r).detach()
+
+    L_D_R = (torch.relu(1 - _disc(D_R, x_r)).mean()
+           + torch.relu(1 + _disc(D_R, x_sr)).mean())
+    L_D_S = (torch.relu(1 - _disc(D_S, x_s)).mean()
+           + torch.relu(1 + _disc(D_S, x_rs)).mean())
 
     loss = L_D_R + L_D_S
     return loss, {"D_R": L_D_R.item(), "D_S": L_D_S.item()}
@@ -170,6 +202,10 @@ def main():
     parser.add_argument("--lam-info-max", type=float, default=1.0)
     parser.add_argument("--info-ramp",    type=int,   default=50,
                         help="Joint epochs over which lambda_info ramps 0→lam_info_max")
+    parser.add_argument("--freeze-scalars",  action="store_true",
+                        help="Wave-only generators/discriminators; scalars bypass G and route directly to encoder")
+    parser.add_argument("--clamp-info-gap", action="store_true",
+                        help="L_info_G = relu(npe_srs - npe_sim): gradient to G only when gap > 0")
     parser.add_argument("--no-info-in-G", action="store_true",
                         help="Zero lam_info in generator step; posterior still uses full ramp")
     parser.add_argument("--batch-size",   type=int, default=512)
@@ -233,10 +269,10 @@ def main():
     # ── Models ────────────────────────────────────────────────────────────────
     encoder = LipschitzEncoder(latent_dim=args.latent_dim).to(device)
     flow    = build_flow_net(args.latent_dim, theta_all).to(device)
-    G_sr    = DualBranchGenerator().to(device)
-    G_rs    = DualBranchGenerator().to(device)
-    D_R     = DualBranchDiscriminator().to(device)
-    D_S     = DualBranchDiscriminator().to(device)
+    G_sr    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
+    G_rs    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
+    D_R     = DualBranchDiscriminator(wave_only=args.freeze_scalars).to(device)
+    D_S     = DualBranchDiscriminator(wave_only=args.freeze_scalars).to(device)
 
     if args.resume:
         encoder.load_state_dict(torch.load(run_dir / "encoder.pt", map_location=device, weights_only=True))
@@ -319,6 +355,8 @@ def main():
                 G_loss, G_info = loss_generator(
                     G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
                     encoder, flow, args.lam_cyc, args.lam_id, lam_info_G,
+                    wave_only=args.freeze_scalars,
+                    clamp_info_gap=args.clamp_info_gap,
                 )
                 G_loss.backward()
                 opt_G.step()
@@ -333,7 +371,8 @@ def main():
             # ── 2. Discriminator step (joint only) ────────────────────────
             if phase == "joint":
                 opt_D.zero_grad()
-                D_loss, D_info = loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r)
+                D_loss, D_info = loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r,
+                                                   wave_only=args.freeze_scalars)
                 D_loss.backward()
                 opt_D.step()
                 D_loss_sum += D_loss.item()
@@ -346,7 +385,11 @@ def main():
             # Build x_srs detached (no grad into G from posterior step)
             if phase == "joint":
                 with torch.no_grad():
-                    x_srs_detached = G_rs(G_sr(x_s))
+                    if args.freeze_scalars:
+                        waves_srs = G_rs(G_sr(x_s[:, :_WAVE_DIM]))
+                        x_srs_detached = torch.cat([waves_srs, x_s[:, _WAVE_DIM:]], dim=1)
+                    else:
+                        x_srs_detached = G_rs(G_sr(x_s))
             else:
                 x_srs_detached = None
 
@@ -418,6 +461,11 @@ def main():
             "losses": {
                 "lam_cyc": args.lam_cyc, "lam_id": args.lam_id,
                 "lam_info_max": args.lam_info_max,
+            },
+            "flags": {
+                "freeze_scalars": args.freeze_scalars,
+                "clamp_info_gap": args.clamp_info_gap,
+                "no_info_in_G": args.no_info_in_G,
             },
             "data": {
                 "n_sims": args.n_sims, "n_real_beats": len(real_ds),
