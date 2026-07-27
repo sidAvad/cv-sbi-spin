@@ -170,6 +170,8 @@ def main():
     parser.add_argument("--lam-info-max", type=float, default=1.0)
     parser.add_argument("--info-ramp",    type=int,   default=50,
                         help="Joint epochs over which lambda_info ramps 0→lam_info_max")
+    parser.add_argument("--no-info-in-G", action="store_true",
+                        help="Zero lam_info in generator step; posterior still uses full ramp")
     parser.add_argument("--batch-size",   type=int, default=512)
     parser.add_argument("--lr-npe",       type=float, default=1e-4)
     parser.add_argument("--lr-gan",       type=float, default=2e-4)
@@ -313,9 +315,10 @@ def main():
             # ── 1. Generator step (joint only) ────────────────────────────
             if phase == "joint":
                 opt_G.zero_grad()
+                lam_info_G = 0.0 if args.no_info_in_G else lam_info
                 G_loss, G_info = loss_generator(
                     G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
-                    encoder, flow, args.lam_cyc, args.lam_id, lam_info,
+                    encoder, flow, args.lam_cyc, args.lam_id, lam_info_G,
                 )
                 G_loss.backward()
                 opt_G.step()
