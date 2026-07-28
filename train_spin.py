@@ -239,11 +239,16 @@ def main():
     D_S     = DualBranchDiscriminator().to(device)
 
     if args.resume:
-        encoder.load_state_dict(torch.load(run_dir / "encoder.pt", map_location=device, weights_only=True))
-        flow    = torch.load(run_dir / "flow_net.pt", map_location=device, weights_only=False)
-        G_sr.load_state_dict(torch.load(run_dir / "G_sr.pt", map_location=device, weights_only=True))
-        G_rs.load_state_dict(torch.load(run_dir / "G_rs.pt", map_location=device, weights_only=True))
-        log(f"Resumed from checkpoints in {run_dir}")
+        ckpt_root = run_dir / "checkpoints"
+        existing_ckpts = sorted(p for p in ckpt_root.glob("*") if p.is_dir())
+        if not existing_ckpts:
+            raise FileNotFoundError(f"--resume set but no checkpoint subfolders found in {ckpt_root}")
+        resume_dir = existing_ckpts[-1]
+        encoder.load_state_dict(torch.load(resume_dir / "encoder.pt", map_location=device, weights_only=True))
+        flow    = torch.load(resume_dir / "flow_net.pt", map_location=device, weights_only=False)
+        G_sr.load_state_dict(torch.load(resume_dir / "G_sr.pt", map_location=device, weights_only=True))
+        G_rs.load_state_dict(torch.load(resume_dir / "G_rs.pt", map_location=device, weights_only=True))
+        log(f"Resumed from checkpoints in {resume_dir}")
 
     log(f"Encoder params:    {sum(p.numel() for p in encoder.parameters()):,}")
     log(f"G_sr/G_rs params:  {sum(p.numel() for p in G_sr.parameters()):,} each")
@@ -388,11 +393,13 @@ def main():
         csv_fh.flush()
 
     # ── Save checkpoints ──────────────────────────────────────────────────────
-    torch.save(encoder.state_dict(), run_dir / "encoder.pt")
-    torch.save(flow,                  run_dir / "flow_net.pt")
-    torch.save(G_sr.state_dict(),     run_dir / "G_sr.pt")
-    torch.save(G_rs.state_dict(),     run_dir / "G_rs.pt")
-    log(f"Saved checkpoints to {run_dir}")
+    ckpt_dir = run_dir / "checkpoints" / ts
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(encoder.state_dict(), ckpt_dir / "encoder.pt")
+    torch.save(flow,                  ckpt_dir / "flow_net.pt")
+    torch.save(G_sr.state_dict(),     ckpt_dir / "G_sr.pt")
+    torch.save(G_rs.state_dict(),     ckpt_dir / "G_rs.pt")
+    log(f"Saved checkpoints to {ckpt_dir}")
 
     # ── run_info (overwrite with full info on completion) ─────────────────────
     import subprocess
