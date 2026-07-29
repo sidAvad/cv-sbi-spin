@@ -10,7 +10,7 @@ SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascul
 
 - Frozen v3 encoder and flow are loaded from `cv-dann-sbi` outputs.
 - Same data layout, constants, and waveform format.
-- Same real patient data: 802 patients at `/home/sa4604/real_data/onebeat_300patients/` on adamant.
+- Same real patient data: 802 patients at `/home/sa4604/data/real_data/onebeat_300patients/` on adamant.
 - Same sim data: `/media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314` on adamant.
 
 ## Key references
