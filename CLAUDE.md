@@ -20,9 +20,10 @@ SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascul
 
 ## Directory layout on adamant (see global CLAUDE.md for the full convention)
 
-- `~/projects/cv-sbi-spin/` — this repo, git clone (code only)
+- `~/projects/cv-sbi-spin/` — this repo, git clone (core model/training code: `dataset.py`, `models.py`, `train_spin.py`)
 - `~/outputs/cv-sbi-spin/<run>/` — checkpoints, logs, `run_info.json` per run; adamant-only, not synced, not git-tracked
-- `~/results/cv-sbi-spin/<run>/` — eval scripts' generated images; bidirectionally mutagen-synced with local
+- `~/results/cv-sbi-spin/scripts/` — eval/plotting scripts (`eval_common.py` + `eval_*.py`); **not** git-tracked, deliberately — these are thin, disposable, iterated-on-quickly wrappers, unlike the core code in `projects/`. Bidirectionally mutagen-synced with local, so local edits appear on adamant automatically and generated images sync back down the same way.
+- `~/results/cv-sbi-spin/<run>/` — eval scripts' generated images, one folder per run
 
 ## Checkpoint layout
 
