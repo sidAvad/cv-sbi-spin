@@ -1,20 +1,30 @@
 """
 SPIN training: sim↔real dual generators + information-preserving posterior.
 
+v2b variant: WDGRL+GRL replaces the hinge-loss adversarial mechanism (v1/v2a).
+D_R/D_S become genuine WGAN-GP critics, trained with their own multi-step inner
+loop each batch (n_critic updates, gradient penalty for the Lipschitz constraint —
+same scheme as cv-dann-sbi's WDGRL). The generator step no longer needs a
+hand-negated adversarial loss term: GradientReversalLayer sits between each
+generator's output and its (frozen, at this step) critic, so a plain minimize of
+the critic's score on the reversed-gradient path trains G_sr/G_rs to fool it,
+in one step, without an explicit "-D(x).mean()" formula.
+
 Schedule (per spec §3):
   Phase 0  flow-warmup   (ep 1–2)    flow trains, encoder frozen, G/D idle
   Phase 1  enc-warmup    (ep 3–12)   encoder trains, flow frozen, G/D idle
-  Phase 2  joint         (ep 13+)    per-batch: generator step → discriminator step → posterior step
+  Phase 2  joint         (ep 13+)    per-batch: critic inner loop → generator step → posterior step
 
-Per-batch step order (joint phase only, §2):
-  1. Generator step   — update G_sr, G_rs       (encoder/flow as fixed functions, not detached)
-  2. Discriminator step — update D_R, D_S       (generator outputs detached)
-  3. Posterior step   — update h_ω, q_ψ         (x_srs detached, no grad into G)
+Per-batch step order (joint phase only):
+  1. Critic inner loop  — n_critic updates to D_R, D_S (WGAN-GP; G_sr/G_rs outputs detached)
+  2. Generator step     — update G_sr, G_rs via GRL-reversed gradient through frozen D_R/D_S
+                           (encoder/flow as fixed functions for L_info, not detached)
+  3. Posterior step     — update h_ω, q_ψ         (x_srs detached, no grad into G)
 
 Optimizers:
-  opt_G   : Adam(G_sr + G_rs,   lr=2e-4, betas=(0.5, 0.999))
-  opt_D   : Adam(D_R  + D_S,    lr=2e-4, betas=(0.5, 0.999))
-  opt_NPE : AdamW(encoder + flow, lr=1e-4)
+  opt_critic : Adam(D_R + D_S,      lr=2e-4, betas=(0.5, 0.9))
+  opt_G      : Adam(G_sr + G_rs,    lr=2e-4, betas=(0.5, 0.999))
+  opt_NPE    : AdamW(encoder + flow, lr=1e-4)
 """
 
 import argparse
@@ -37,21 +47,40 @@ from dataset import (
 _WAVE_DIM = N_REDUCED_CHANNELS * T  # 804
 from models import (
     LipschitzEncoder, build_flow_net,
-    DualBranchGenerator, DualBranchDiscriminator,
+    DualBranchGenerator, DualBranchDiscriminator, GradientReversalLayer,
 )
 
 
 # ── Losses ────────────────────────────────────────────────────────────────────
 
+def gradient_penalty(disc_fn, x_fake, x_real, device):
+    """
+    1-Lipschitz gradient penalty for WGAN-GP at random interpolates between a
+    (detached) fake and real batch. disc_fn already handles wave_only slicing.
+
+    create_graph=True is critical — without it the GP has no gradient through
+    the critic and the Lipschitz constraint is not enforced. Ported from
+    cv-dann-sbi/train_joint.py (there interpolates a flat latent z; here it
+    interpolates the raw observation tensor — same formula works generically).
+    """
+    eps   = torch.rand(x_fake.shape[0], 1, device=device)
+    x_hat = (eps * x_fake.detach() + (1 - eps) * x_real.detach()).requires_grad_(True)
+    f_hat = disc_fn(x_hat)
+    grads = torch.autograd.grad(f_hat.sum(), x_hat, create_graph=True)[0]
+    return ((grads.norm(2, dim=1) - 1) ** 2).mean()
+
+
 def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
-                   encoder, flow, lam_cyc, lam_id, lam_info, lam_adv=1.0,
+                   encoder, flow, lam_cyc, lam_id, lam_info, grl, lam_adv=1.0,
                    wave_only=False, clamp_info_gap=False):
     """
     Generator step: update G_sr and G_rs.
 
     encoder + flow are used as fixed functions — gradients flow THROUGH them back to
     G_sr/G_rs (no .detach()), but their weights are not in opt_G so they don't update
-    here. They update only via opt_NPE in the posterior step.
+    here. They update only via opt_NPE in the posterior step. D_R/D_S are likewise
+    fixed here (not in opt_G) — forward value is unaffected by that; only the
+    gradient reaching G_sr/G_rs matters, and grl reverses it (v2b WDGRL+GRL).
 
     wave_only: generators receive/return waves only (804-dim); scalars are passed through
                unchanged and concatenated back before encoder/discriminator calls.
@@ -77,8 +106,11 @@ def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
     x_srs = _gen(G_rs, x_sr)  # sim → real → sim  (round trip, spec §1b + §1d)
     x_rsr = _gen(G_sr, x_rs)  # real → sim → real (round trip, spec §1b)
 
-    # Adversarial — generators push discriminators toward positive (spec §1a)
-    L_adv = -_disc(D_R, x_sr).mean() - _disc(D_S, x_rs).mean()
+    # WDGRL+GRL adversarial term (v2b): grl is identity in forward (so this is
+    # numerically just the critic's score on the translated samples), but reverses
+    # the gradient reaching G_sr/G_rs on backward — minimizing this plain score
+    # trains the generators to fool the (frozen-here) critics, no manual negation.
+    L_adv = _disc(D_R, grl(x_sr)).mean() + _disc(D_S, grl(x_rs)).mean()
 
     # Cycle consistency — L1 on both round trips (spec §1b)
     L_cyc = (x_srs - x_s).abs().mean() + (x_rsr - x_r).abs().mean()
@@ -116,32 +148,36 @@ def loss_generator(G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
     }
 
 
-def loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r, wave_only=False):
+def loss_critics(G_sr, G_rs, D_R, D_S, x_s, x_r, gp_weight, device, wave_only=False):
     """
-    Discriminator step: update D_R and D_S.
+    Critic step (v2b): update D_R and D_S as genuine WGAN-GP critics — one call
+    per n_critic inner iteration. G_sr(x_s)/G_rs(x_r) are recomputed fresh each
+    call (cheap; G isn't updated during this loop, so callers may also compute
+    them once outside and pass detached tensors in — kept here for a self-
+    contained per-step API matching cv-dann-sbi's critic loop).
 
-    Hinge loss (spec §1a):
-      L_D_R = relu(1 - D_R(x_r)).mean() + relu(1 + D_R(x_sr.detach())).mean()
-      L_D_S = relu(1 - D_S(x_s)).mean() + relu(1 + D_S(x_rs.detach())).mean()
+    L_critic = -(E[D(real)] - E[D(fake)]) + gp_weight * GP   (per critic, summed)
     """
     def _gen(G, x):
         if wave_only:
             return torch.cat([G(x[:, :_WAVE_DIM]), x[:, _WAVE_DIM:]], dim=1)
         return G(x)
 
-    def _disc(D, x):
-        return D(x[:, :_WAVE_DIM]) if wave_only else D(x)
+    def _disc_R(x): return D_R(x[:, :_WAVE_DIM]) if wave_only else D_R(x)
+    def _disc_S(x): return D_S(x[:, :_WAVE_DIM]) if wave_only else D_S(x)
 
     x_sr = _gen(G_sr, x_s).detach()
     x_rs = _gen(G_rs, x_r).detach()
 
-    L_D_R = (torch.relu(1 - _disc(D_R, x_r)).mean()
-           + torch.relu(1 + _disc(D_R, x_sr)).mean())
-    L_D_S = (torch.relu(1 - _disc(D_S, x_s)).mean()
-           + torch.relu(1 + _disc(D_S, x_rs)).mean())
+    w1_R = _disc_R(x_r).mean() - _disc_R(x_sr).mean()
+    w1_S = _disc_S(x_s).mean() - _disc_S(x_rs).mean()
 
-    loss = L_D_R + L_D_S
-    return loss, {"D_R": L_D_R.item(), "D_S": L_D_S.item()}
+    gp_R = gradient_penalty(_disc_R, x_sr, x_r, device)
+    gp_S = gradient_penalty(_disc_S, x_rs, x_s, device)
+
+    loss = (-w1_R + gp_weight * gp_R) + (-w1_S + gp_weight * gp_S)
+    return loss, {"w1_R": w1_R.item(), "w1_S": w1_S.item(),
+                 "gp_R": gp_R.item(), "gp_S": gp_S.item()}
 
 
 def loss_posterior(encoder, flow, x_s, theta, x_srs_detached, lam_info):
@@ -208,6 +244,12 @@ def main():
                         help="L_info_G = relu(npe_srs - npe_sim): gradient to G only when gap > 0")
     parser.add_argument("--no-info-in-G", action="store_true",
                         help="Zero lam_info in generator step; posterior still uses full ramp")
+    parser.add_argument("--n-critic",     type=int,   default=5,
+                        help="v2b WDGRL+GRL: critic inner-loop updates per generator step")
+    parser.add_argument("--gp-weight",    type=float, default=10.0,
+                        help="v2b WDGRL+GRL: gradient penalty weight (WGAN-GP Lipschitz constraint)")
+    parser.add_argument("--grl-alpha",    type=float, default=1.0,
+                        help="v2b WDGRL+GRL: gradient reversal scale reaching G_sr/G_rs")
     parser.add_argument("--batch-size",   type=int, default=512)
     parser.add_argument("--lr-npe",       type=float, default=1e-4)
     parser.add_argument("--lr-gan",       type=float, default=2e-4)
@@ -273,6 +315,7 @@ def main():
     G_rs    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
     D_R     = DualBranchDiscriminator(wave_only=args.freeze_scalars).to(device)
     D_S     = DualBranchDiscriminator(wave_only=args.freeze_scalars).to(device)
+    grl     = GradientReversalLayer(alpha=args.grl_alpha)
 
     if args.resume:
         ckpt_root = run_dir / "checkpoints"
@@ -288,16 +331,17 @@ def main():
 
     log(f"Encoder params:    {sum(p.numel() for p in encoder.parameters()):,}")
     log(f"G_sr/G_rs params:  {sum(p.numel() for p in G_sr.parameters()):,} each")
-    log(f"D_R/D_S params:    {sum(p.numel() for p in D_R.parameters()):,} each")
+    log(f"D_R/D_S params:    {sum(p.numel() for p in D_R.parameters()):,} each  (WDGRL critics, v2b)")
+    log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  grl_alpha={args.grl_alpha}")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
     opt_G   = torch.optim.Adam(
         list(G_sr.parameters()) + list(G_rs.parameters()),
         lr=args.lr_gan, betas=(0.5, 0.999),
     )
-    opt_D   = torch.optim.Adam(
+    opt_critic = torch.optim.Adam(
         list(D_R.parameters()) + list(D_S.parameters()),
-        lr=args.lr_gan, betas=(0.5, 0.999),
+        lr=args.lr_gan, betas=(0.5, 0.9),
     )
     opt_NPE = torch.optim.AdamW(
         list(encoder.parameters()) + list(flow.parameters()),
@@ -314,7 +358,7 @@ def main():
         csv_path = run_dir / f"train_log_{ts}.csv"
         csv_fh   = open(csv_path, "w")
         csv_fh.write("epoch,phase,npe_sim,npe_srs,gap,L_adv,L_cyc,L_id,L_info_G,"
-                     "loss_G,L_D_R,L_D_S,loss_D,delta_waves,delta_scal,lam_info\n")
+                     "loss_G,w1_R,w1_S,gp_R,gp_S,loss_critic,delta_waves,delta_scal,lam_info\n")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     end_epoch = args.start_epoch + args.max_epochs - 1
@@ -336,9 +380,9 @@ def main():
         for p in D_R.parameters():     p.requires_grad = (phase == "joint")
         for p in D_S.parameters():     p.requires_grad = (phase == "joint")
 
-        enc_npe_sum = G_loss_sum = D_loss_sum = npe_srs_sum = 0.0
+        enc_npe_sum = G_loss_sum = critic_loss_sum = npe_srs_sum = 0.0
         adv_sum = cyc_sum = id_sum = info_g_sum = 0.0
-        D_R_sum = D_S_sum = dw_sum = ds_sum = 0.0
+        w1_R_sum = w1_S_sum = gp_R_sum = gp_S_sum = dw_sum = ds_sum = 0.0
         n_batches = 0
 
         real_iter = iter(real_dl)
@@ -353,13 +397,36 @@ def main():
                 real_iter = iter(real_dl)
                 x_r = next(real_iter).to(device)
 
-            # ── 1. Generator step (joint only) ────────────────────────────
+            # ── 1. Critic inner loop (joint only, v2b WDGRL+GRL) ──────────
+            # n_critic updates to D_R/D_S; same (x_s, x_r) batch reused across all
+            # of them (G isn't updated here, so G_sr(x_s)/G_rs(x_r) wouldn't change
+            # between iterations anyway — this is a deliberate simplification vs
+            # cv-dann-sbi's version, which redraws a fresh real sample each inner
+            # step; here the real batch also stays fixed for the whole outer step).
+            if phase == "joint":
+                critic_loss_ep = w1_R_ep = w1_S_ep = gp_R_ep = gp_S_ep = 0.0
+                for _ in range(args.n_critic):
+                    opt_critic.zero_grad()
+                    critic_loss, critic_info = loss_critics(
+                        G_sr, G_rs, D_R, D_S, x_s, x_r, args.gp_weight, device,
+                        wave_only=args.freeze_scalars,
+                    )
+                    critic_loss.backward()
+                    opt_critic.step()
+                    critic_loss_ep += critic_loss.item()
+                    w1_R_ep += critic_info["w1_R"]; w1_S_ep += critic_info["w1_S"]
+                    gp_R_ep += critic_info["gp_R"]; gp_S_ep += critic_info["gp_S"]
+                critic_loss_sum += critic_loss_ep / args.n_critic
+                w1_R_sum += w1_R_ep / args.n_critic; w1_S_sum += w1_S_ep / args.n_critic
+                gp_R_sum += gp_R_ep / args.n_critic; gp_S_sum += gp_S_ep / args.n_critic
+
+            # ── 2. Generator step (joint only) ────────────────────────────
             if phase == "joint":
                 opt_G.zero_grad()
                 lam_info_G = 0.0 if args.no_info_in_G else lam_info
                 G_loss, G_info = loss_generator(
                     G_sr, G_rs, D_R, D_S, x_s, x_r, theta,
-                    encoder, flow, args.lam_cyc, args.lam_id, lam_info_G,
+                    encoder, flow, args.lam_cyc, args.lam_id, lam_info_G, grl,
                     wave_only=args.freeze_scalars,
                     clamp_info_gap=args.clamp_info_gap,
                 )
@@ -372,17 +439,6 @@ def main():
                 info_g_sum  += G_info["info"]
                 dw_sum      += G_info["delta_w"]
                 ds_sum      += G_info["delta_s"]
-
-            # ── 2. Discriminator step (joint only) ────────────────────────
-            if phase == "joint":
-                opt_D.zero_grad()
-                D_loss, D_info = loss_discriminator(G_sr, G_rs, D_R, D_S, x_s, x_r,
-                                                   wave_only=args.freeze_scalars)
-                D_loss.backward()
-                opt_D.step()
-                D_loss_sum += D_loss.item()
-                D_R_sum    += D_info["D_R"]
-                D_S_sum    += D_info["D_S"]
 
             # ── 3. Posterior step (all phases) ────────────────────────────
             opt_NPE.zero_grad()
@@ -413,25 +469,27 @@ def main():
         npe_sim  = enc_npe_sum / n_batches
         npe_srs  = npe_srs_sum / n_batches
         gap      = npe_srs - npe_sim
-        G_loss_e = G_loss_sum  / nb
-        D_loss_e = D_loss_sum  / nb
+        G_loss_e      = G_loss_sum      / nb
+        critic_loss_e = critic_loss_sum / nb
         adv_e    = adv_sum     / nb
         cyc_e    = cyc_sum     / nb
         id_e     = id_sum      / nb
         info_g_e = info_g_sum  / nb
-        D_R_e    = D_R_sum     / nb
-        D_S_e    = D_S_sum     / nb
+        w1_R_e   = w1_R_sum    / nb
+        w1_S_e   = w1_S_sum    / nb
+        gp_R_e   = gp_R_sum    / nb
+        gp_S_e   = gp_S_sum    / nb
         dw_e     = dw_sum      / nb
         ds_e     = ds_sum      / nb
 
         log(f"  ep {abs_epoch:3d}/{end_epoch}  [{phase}]"
             f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}  gap={gap:+.4f}"
             f"  L_adv={adv_e:.4f}  L_cyc={cyc_e:.4f}  L_id={id_e:.4f}  L_info={info_g_e:.4f}"
-            f"  L_D_R={D_R_e:.4f}  L_D_S={D_S_e:.4f}"
+            f"  w1_R={w1_R_e:.4f}  w1_S={w1_S_e:.4f}  gp_R={gp_R_e:.4f}  gp_S={gp_S_e:.4f}"
             f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}")
         csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},{gap:.6f},"
                      f"{adv_e:.6f},{cyc_e:.6f},{id_e:.6f},{info_g_e:.6f},{G_loss_e:.6f},"
-                     f"{D_R_e:.6f},{D_S_e:.6f},{D_loss_e:.6f},"
+                     f"{w1_R_e:.6f},{w1_S_e:.6f},{gp_R_e:.6f},{gp_S_e:.6f},{critic_loss_e:.6f},"
                      f"{dw_e:.6f},{ds_e:.6f},{lam_info:.4f}\n")
         csv_fh.flush()
 
@@ -473,6 +531,11 @@ def main():
                 "freeze_scalars": args.freeze_scalars,
                 "clamp_info_gap": args.clamp_info_gap,
                 "no_info_in_G": args.no_info_in_G,
+            },
+            "wdgrl": {
+                "n_critic": args.n_critic,
+                "gp_weight": args.gp_weight,
+                "grl_alpha": args.grl_alpha,
             },
             "data": {
                 "n_sims": args.n_sims, "n_real_beats": len(real_ds),

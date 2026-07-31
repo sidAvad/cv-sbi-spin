@@ -7,7 +7,8 @@ Carried over from cv-dann-sbi (unchanged):
 
 New for SPIN:
   DualBranchGenerator    — G_sr / G_rs (1D conv waveform trunk + scalar MLP, residual output)
-  DualBranchDiscriminator — D_R / D_S (spectral-norm, hinge loss)
+  DualBranchDiscriminator — D_R / D_S (spectral-norm; hinge loss in v1/v2a, WGAN-GP critic in v2b)
+  GradientReversalLayer  — v2b only: identity forward, reversed gradient backward
 """
 
 import torch
@@ -302,3 +303,28 @@ class DualBranchDiscriminator(nn.Module):
 
         h_s = self.scalar_branch(scalars)                  # (B, 32)
         return self.head(torch.cat([h_w, h_s], dim=1)).squeeze(-1)  # (B,)
+
+
+# ── Gradient reversal (v2b: WDGRL+GRL variant) ──────────────────────────────────
+# Ported from cv-dann-sbi/models.py verbatim.
+
+class _GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Identity in forward; reverses and scales gradients on backward."""
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _GradientReversalFunction.apply(x, self.alpha)
