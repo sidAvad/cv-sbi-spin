@@ -249,7 +249,9 @@ def main():
     parser.add_argument("--gp-weight",    type=float, default=10.0,
                         help="v2b WDGRL+GRL: gradient penalty weight (WGAN-GP Lipschitz constraint)")
     parser.add_argument("--grl-alpha",    type=float, default=1.0,
-                        help="v2b WDGRL+GRL: gradient reversal scale reaching G_sr/G_rs")
+                        help="v2b WDGRL+GRL: target gradient reversal scale reaching G_sr/G_rs (ramped, not applied at full strength immediately)")
+    parser.add_argument("--adv-ramp",     type=int,   default=50,
+                        help="Joint epochs over which GRL alpha ramps 0→grl_alpha (mirrors --info-ramp; cv-dann-sbi's v3 ramped its analogous lambda over 100 epochs)")
     parser.add_argument("--batch-size",   type=int, default=512)
     parser.add_argument("--lr-npe",       type=float, default=1e-4)
     parser.add_argument("--lr-gan",       type=float, default=2e-4)
@@ -332,7 +334,8 @@ def main():
     log(f"Encoder params:    {sum(p.numel() for p in encoder.parameters()):,}")
     log(f"G_sr/G_rs params:  {sum(p.numel() for p in G_sr.parameters()):,} each")
     log(f"D_R/D_S params:    {sum(p.numel() for p in D_R.parameters()):,} each  (WDGRL critics, v2b)")
-    log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  grl_alpha={args.grl_alpha}")
+    log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  "
+        f"grl_alpha={args.grl_alpha} (ramped over {args.adv_ramp} joint epochs)")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
     opt_G   = torch.optim.Adam(
@@ -358,7 +361,7 @@ def main():
         csv_path = run_dir / f"train_log_{ts}.csv"
         csv_fh   = open(csv_path, "w")
         csv_fh.write("epoch,phase,npe_sim,npe_srs,gap,L_adv,L_cyc,L_id,L_info_G,"
-                     "loss_G,w1_R,w1_S,gp_R,gp_S,loss_critic,delta_waves,delta_scal,lam_info\n")
+                     "loss_G,w1_R,w1_S,gp_R,gp_S,loss_critic,delta_waves,delta_scal,lam_info,grl_alpha\n")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     end_epoch = args.start_epoch + args.max_epochs - 1
@@ -371,6 +374,8 @@ def main():
 
         lam_info = (lambda_info_schedule(abs_epoch, joint_start, end_epoch, args.info_ramp)
                     * args.lam_info_max if phase == "joint" else 0.0)
+        grl.alpha = (lambda_info_schedule(abs_epoch, joint_start, end_epoch, args.adv_ramp)
+                    * args.grl_alpha if phase == "joint" else 0.0)
 
         # Freeze / unfreeze
         for p in encoder.parameters(): p.requires_grad = (phase != "flow-warmup")
@@ -486,11 +491,11 @@ def main():
             f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}  gap={gap:+.4f}"
             f"  L_adv={adv_e:.4f}  L_cyc={cyc_e:.4f}  L_id={id_e:.4f}  L_info={info_g_e:.4f}"
             f"  w1_R={w1_R_e:.4f}  w1_S={w1_S_e:.4f}  gp_R={gp_R_e:.4f}  gp_S={gp_S_e:.4f}"
-            f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}")
+            f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}  grl_α={grl.alpha:.3f}")
         csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},{gap:.6f},"
                      f"{adv_e:.6f},{cyc_e:.6f},{id_e:.6f},{info_g_e:.6f},{G_loss_e:.6f},"
                      f"{w1_R_e:.6f},{w1_S_e:.6f},{gp_R_e:.6f},{gp_S_e:.6f},{critic_loss_e:.6f},"
-                     f"{dw_e:.6f},{ds_e:.6f},{lam_info:.4f}\n")
+                     f"{dw_e:.6f},{ds_e:.6f},{lam_info:.4f},{grl.alpha:.4f}\n")
         csv_fh.flush()
 
     # ── Save checkpoints ──────────────────────────────────────────────────────
@@ -536,6 +541,7 @@ def main():
                 "n_critic": args.n_critic,
                 "gp_weight": args.gp_weight,
                 "grl_alpha": args.grl_alpha,
+                "adv_ramp": args.adv_ramp,
             },
             "data": {
                 "n_sims": args.n_sims, "n_real_beats": len(real_ds),
