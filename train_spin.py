@@ -261,11 +261,14 @@ def main():
                         help="Load existing checkpoints from run_dir and continue training")
     parser.add_argument("--start-epoch",  type=int, default=1,
                         help="Epoch offset for display and lambda schedule (set to prev max_epochs+1 when resuming)")
+    parser.add_argument("--outputs-root", default="/home/sa4604/outputs/cv-sbi-spin",
+                        help="Absolute root for run_dir — was a CWD-relative 'outputs/' path, which broke once "
+                             "the code moved to ~/projects/ separately from ~/outputs/ (see CLAUDE.md)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_dir = Path("outputs") / args.run
+    run_dir = Path(args.outputs_root) / args.run
     log, log_fh = make_log(run_dir)
 
     ts = f"{datetime.now():%Y%m%d-%H%M%S}"
