@@ -10,13 +10,24 @@ SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascul
 
 - Frozen v3 encoder and flow are loaded from `cv-dann-sbi` outputs.
 - Same data layout, constants, and waveform format.
-- Same real patient data: 802 patients at `/home/sa4604/real_data/onebeat_300patients/` on adamant.
+- Same real patient data: 802 patients at `/home/sa4604/data/real_data/onebeat_300patients/` on adamant.
 - Same sim data: `/media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314` on adamant.
 
 ## Key references
 
 - **cv-dann-sbi best model**: `exp-v3_encoder-lipschitz_dann_flow-maf5` — task=12.84, w1=0.85
-- **Norm stats**: `norm_stats.json` in cv-dann-sbi (sim stats, used as shared normalization)
+- **Norm stats**: `norm_stats.json` (sim stats, shared normalization) — symlinked in this repo's root to `~/outputs/cv-dann-sbi/norm_stats.json` on adamant, the actual source of truth
+
+## Directory layout on adamant (see global CLAUDE.md for the full convention)
+
+- `~/projects/cv-sbi-spin/` — this repo, git clone (core model/training code: `dataset.py`, `models.py`, `train_spin.py`)
+- `~/outputs/cv-sbi-spin/<run>/` — checkpoints, logs, `run_info.json` per run; adamant-only, not synced, not git-tracked
+- `~/results/cv-sbi-spin/scripts/` — eval/plotting scripts (`eval_common.py` + `eval_*.py`); **not** git-tracked, deliberately — these are thin, disposable, iterated-on-quickly wrappers, unlike the core code in `projects/`. Bidirectionally mutagen-synced with local, so local edits appear on adamant automatically and generated images sync back down the same way.
+- `~/results/cv-sbi-spin/<run>/` — eval scripts' generated images, one folder per run
+
+## Checkpoint layout
+
+`train_spin.py` saves to `~/outputs/cv-sbi-spin/<run>/checkpoints/<start_ts>/{encoder,flow_net,G_sr,G_rs}.pt`, where `<start_ts>` matches that run's `train_log_<start_ts>.csv` and `run_info_v{version}_<start_ts>.json`. Never overwrites a prior run's checkpoints in place — each training invocation gets its own timestamped subfolder, so re-running the same `--run` name (e.g. after changing hyperparameters) preserves every prior attempt. Eval scripts resolve the latest timestamp under `checkpoints/` by default.
 
 ## Versioning and branching convention
 

@@ -147,6 +147,9 @@ class DualBranchGenerator(nn.Module):
     Fused at bottleneck via broadcasted concat + pointwise conv.
     Residual output: x_out = x_in + Δ, with zero-init output heads (identity at init).
 
+    wave_only=True: scalar branch removed; input/output are 804-dim waves only.
+    Scalars are routed directly through the training loop and never touch the generator.
+
     Use one instance for G_sr (sim→real) and one for G_rs (real→sim).
 
     Shape trace (wave branch, default channels):
@@ -159,9 +162,11 @@ class DualBranchGenerator(nn.Module):
       up1+mix1: up (B,64,100)→(B,32,201), cat enc1 skip → mix → (B,32,201)  [output_padding=1]
     """
 
-    def __init__(self, wave_ch: int = 32, scalar_hidden: int = 32, bottleneck_ch: int = 256):
+    def __init__(self, wave_ch: int = 32, scalar_hidden: int = 32,
+                 bottleneck_ch: int = 256, wave_only: bool = False):
         super().__init__()
-        self.wave_len = N_REDUCED_CHANNELS * T  # 804
+        self.wave_len  = N_REDUCED_CHANNELS * T  # 804
+        self.wave_only = wave_only
 
         # Waveform encoder
         self.enc1 = nn.Sequential(
@@ -177,14 +182,16 @@ class DualBranchGenerator(nn.Module):
             nn.Conv1d(wave_ch*4, bottleneck_ch, 4, stride=2, padding=1), nn.SiLU()
         )
 
-        # Scalar branch
-        self.scalar_enc = nn.Sequential(
-            nn.Linear(N_SCALARS, scalar_hidden), nn.SiLU(),
-            nn.Linear(scalar_hidden, scalar_hidden), nn.SiLU(),
-        )
-
-        # Bottleneck fusion: broadcast scalar features over spatial dim, concat, fuse
-        self.bottleneck = nn.Conv1d(bottleneck_ch + scalar_hidden, bottleneck_ch, 1)
+        if not wave_only:
+            # Scalar branch + bottleneck fusion
+            self.scalar_enc = nn.Sequential(
+                nn.Linear(N_SCALARS, scalar_hidden), nn.SiLU(),
+                nn.Linear(scalar_hidden, scalar_hidden), nn.SiLU(),
+            )
+            self.bottleneck = nn.Conv1d(bottleneck_ch + scalar_hidden, bottleneck_ch, 1)
+        else:
+            # No scalar fusion — bottleneck is a plain pointwise conv
+            self.bottleneck = nn.Conv1d(bottleneck_ch, bottleneck_ch, 1)
 
         # Waveform decoder: upsample first, then concat skip, then mix
         self.up3  = nn.ConvTranspose1d(bottleneck_ch, wave_ch*4, 4, stride=2, padding=1)
@@ -197,14 +204,19 @@ class DualBranchGenerator(nn.Module):
         self.mix1 = nn.Sequential(nn.Conv1d(wave_ch*2, wave_ch, 3, padding=1), nn.SiLU())
 
         # Output heads — zero-init so generator starts as identity
-        self.wave_head   = nn.Conv1d(wave_ch, N_REDUCED_CHANNELS, 1)
-        self.scalar_head = nn.Linear(scalar_hidden, N_SCALARS)
-        nn.init.zeros_(self.wave_head.weight);   nn.init.zeros_(self.wave_head.bias)
-        nn.init.zeros_(self.scalar_head.weight); nn.init.zeros_(self.scalar_head.bias)
+        self.wave_head = nn.Conv1d(wave_ch, N_REDUCED_CHANNELS, 1)
+        nn.init.zeros_(self.wave_head.weight); nn.init.zeros_(self.wave_head.bias)
+
+        if not wave_only:
+            self.scalar_head = nn.Linear(scalar_hidden, N_SCALARS)
+            nn.init.zeros_(self.scalar_head.weight); nn.init.zeros_(self.scalar_head.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
-        scalars = x[:, self.wave_len:]                                   # (B, 5)
+        if self.wave_only:
+            waves = x.view(-1, N_REDUCED_CHANNELS, T)          # input is 804-dim waves only
+        else:
+            waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
+            scalars = x[:, self.wave_len:]                      # (B, 5)
 
         # Encode
         h1 = self.enc1(waves)   # (B, 32, 201)
@@ -212,25 +224,26 @@ class DualBranchGenerator(nn.Module):
         h3 = self.enc3(h2)      # (B, 128,  50)
         h4 = self.enc4(h3)      # (B, 256,  25)
 
-        # Scalar features broadcast to bottleneck spatial dim
-        s        = self.scalar_enc(scalars)                               # (B, 32)
-        s_spatial = s.unsqueeze(-1).expand(-1, -1, h4.shape[-1])         # (B, 32, 25)
-
-        # Fuse at bottleneck
-        h = self.bottleneck(torch.cat([h4, s_spatial], dim=1))           # (B, 256, 25)
+        if self.wave_only:
+            h = self.bottleneck(h4)
+        else:
+            s         = self.scalar_enc(scalars)                            # (B, 32)
+            s_spatial = s.unsqueeze(-1).expand(-1, -1, h4.shape[-1])       # (B, 32, 25)
+            h = self.bottleneck(torch.cat([h4, s_spatial], dim=1))         # (B, 256, 25)
 
         # Decode: upsample → cat skip → mix
         h = self.mix3(torch.cat([F.silu(self.up3(h)), h3], dim=1))   # (B, 128, 50)
         h = self.mix2(torch.cat([F.silu(self.up2(h)), h2], dim=1))   # (B,  64, 100)
         h = self.mix1(torch.cat([F.silu(self.up1(h)), h1], dim=1))   # (B,  32, 201)
 
-        # Residual deltas
-        delta_waves   = self.wave_head(h)            # (B, 4, 201)
-        delta_scalars = self.scalar_head(s)          # (B, 5)
+        delta_waves = self.wave_head(h)                                # (B, 4, 201)
+        out_waves   = waves + delta_waves                              # (B, 4, 201)
 
-        out_waves   = waves   + delta_waves          # (B, 4, 201)
-        out_scalars = scalars + delta_scalars        # (B, 5)
+        if self.wave_only:
+            return out_waves.reshape(-1, self.wave_len)                # (B, 804)
 
+        delta_scalars = self.scalar_head(s)                            # (B, 5)
+        out_scalars   = scalars + delta_scalars
         return torch.cat([out_waves.reshape(-1, self.wave_len), out_scalars], dim=1)  # (B, 809)
 
 
@@ -253,9 +266,10 @@ class DualBranchDiscriminator(nn.Module):
     Use one instance for D_R (real domain) and one for D_S (sim domain).
     """
 
-    def __init__(self, wave_ch: int = 32):
+    def __init__(self, wave_ch: int = 32, wave_only: bool = False):
         super().__init__()
-        self.wave_len = N_REDUCED_CHANNELS * T  # 804
+        self.wave_len  = N_REDUCED_CHANNELS * T  # 804
+        self.wave_only = wave_only
 
         self.wave_branch = nn.Sequential(
             _sn(nn.Conv1d(N_REDUCED_CHANNELS, wave_ch,    4, stride=2, padding=1)), nn.LeakyReLU(0.2),
@@ -263,20 +277,28 @@ class DualBranchDiscriminator(nn.Module):
             _sn(nn.Conv1d(wave_ch*2,          wave_ch*4,  4, stride=2, padding=1)), nn.LeakyReLU(0.2),
         )  # → (B, 128, 25)
 
-        self.scalar_branch = nn.Sequential(
-            _sn(nn.Linear(N_SCALARS, wave_ch)), nn.LeakyReLU(0.2),
-        )  # → (B, 32)
+        if not wave_only:
+            self.scalar_branch = nn.Sequential(
+                _sn(nn.Linear(N_SCALARS, wave_ch)), nn.LeakyReLU(0.2),
+            )  # → (B, 32)
 
-        fused_dim = wave_ch*4 + wave_ch  # 128 + 32
+        fused_dim = wave_ch*4 + (0 if wave_only else wave_ch)  # 128 or 160
         self.head = nn.Sequential(
             _sn(nn.Linear(fused_dim, wave_ch*2)), nn.LeakyReLU(0.2),
             _sn(nn.Linear(wave_ch*2, 1)),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
-        scalars = x[:, self.wave_len:]
+        if self.wave_only:
+            waves = x.view(-1, N_REDUCED_CHANNELS, T)      # input is 804-dim waves only
+        else:
+            waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
+            scalars = x[:, self.wave_len:]
 
-        h_w = self.wave_branch(waves).mean(dim=-1)   # global avg pool → (B, 128)
-        h_s = self.scalar_branch(scalars)             # (B, 32)
+        h_w = self.wave_branch(waves).mean(dim=-1)         # global avg pool → (B, 128)
+
+        if self.wave_only:
+            return self.head(h_w).squeeze(-1)              # (B,)
+
+        h_s = self.scalar_branch(scalars)                  # (B, 32)
         return self.head(torch.cat([h_w, h_s], dim=1)).squeeze(-1)  # (B,)
