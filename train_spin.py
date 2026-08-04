@@ -29,9 +29,11 @@ cv-dann-sbi's train_joint.py — missing this in the original v2b attempt is the
 likely cause of a catastrophic single-epoch divergence around epoch 362).
 
 Optimizers:
-  opt_critic : Adam(D_R + D_S,      lr=2e-4, betas=(0.5, 0.9))
-  opt_G      : Adam(G_sr + G_rs,    lr=2e-4, betas=(0.5, 0.999))
+  opt_critic : Adam(D_R + D_S,      lr=1e-4, betas=(0.5, 0.9))
+  opt_G      : Adam(G_sr + G_rs,    lr=1e-4, betas=(0.5, 0.999))
   opt_NPE    : AdamW(encoder + flow, lr=1e-4)
+
+See experiments.md for run-by-run rationale and results.
 """
 
 import argparse
@@ -258,13 +260,13 @@ def main():
                         help="v2b WDGRL: critic inner-loop updates per generator step")
     parser.add_argument("--gp-weight",    type=float, default=10.0,
                         help="v2b WDGRL: gradient penalty weight (WGAN-GP Lipschitz constraint)")
-    parser.add_argument("--lam-adv-max",  type=float, default=1.0,
+    parser.add_argument("--lam-adv-max",  type=float, default=0.2,
                         help="v2b WDGRL: target weight on the generator's adversarial term (ramped, not applied at full strength immediately)")
     parser.add_argument("--adv-ramp",     type=int,   default=50,
                         help="Joint epochs over which lam_adv ramps 0→lam_adv_max (mirrors --info-ramp; cv-dann-sbi's v3 ramped its analogous lambda_e over 100 epochs)")
     parser.add_argument("--batch-size",   type=int, default=512)
     parser.add_argument("--lr-npe",       type=float, default=1e-4)
-    parser.add_argument("--lr-gan",       type=float, default=2e-4)
+    parser.add_argument("--lr-gan",       type=float, default=1e-4)
     parser.add_argument("--latent-dim",   type=int, default=128)
     parser.add_argument("--stats-path",   default="norm_stats.json")
     parser.add_argument("--resume",       action="store_true",
@@ -405,6 +407,11 @@ def main():
 
         real_iter = iter(real_dl)
 
+        def sample_real(n):
+            """Fresh in-memory random real batch of size n."""
+            idx = torch.randint(0, len(real_ds), (n,))
+            return real_ds.x[idx].to(device)
+
         for theta, x_s in sim_dl:
             theta = theta.to(device)
             x_s   = x_s.to(device)
@@ -416,18 +423,16 @@ def main():
                 x_r = next(real_iter).to(device)
 
             # ── 1. Critic inner loop (joint only, v2b WDGRL) ──────────────
-            # n_critic updates to D_R/D_S; same (x_s, x_r) batch reused across all
-            # of them (G isn't updated here, so G_sr(x_s)/G_rs(x_r) wouldn't change
-            # between iterations anyway — this is a deliberate simplification vs
-            # cv-dann-sbi's version, which redraws a fresh real sample each inner
-            # step; here the real batch also stays fixed for the whole outer step).
+            # n_critic updates to D_R/D_S; x_s fixed for the outer step, x_r
+            # freshly resampled via sample_real() each substep.
             if phase == "joint":
                 critic_loss_ep = w1_R_ep = w1_S_ep = gp_R_ep = gp_S_ep = 0.0
                 critic_params = list(D_R.parameters()) + list(D_S.parameters())
                 for _ in range(args.n_critic):
+                    x_r_c = sample_real(x_s.shape[0])
                     opt_critic.zero_grad()
                     critic_loss, critic_info = loss_critics(
-                        G_sr, G_rs, D_R, D_S, x_s, x_r, args.gp_weight, device,
+                        G_sr, G_rs, D_R, D_S, x_s, x_r_c, args.gp_weight, device,
                         wave_only=args.freeze_scalars,
                     )
                     critic_loss.backward()
