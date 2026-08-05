@@ -231,6 +231,16 @@ def main():
     log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Run: {args.run}  v={args.version}")
     log(f"Device: {device}  max_epochs: {args.max_epochs}")
 
+    # Capture git_hash now, at the start — not at completion, so switching branches in this
+    # checkout later (e.g. to work on something else while this run trains) can't retroactively
+    # corrupt the recorded provenance for this run.
+    import subprocess
+    try:
+        git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                           text=True, stderr=subprocess.DEVNULL).strip()
+    except subprocess.CalledProcessError:
+        git_hash = "unknown"
+
     # Write run_info immediately so the command is captured even on crash
     with open(run_dir / f"run_info_v{args.version}_{ts}.json", "w") as f:
         json.dump({
@@ -238,6 +248,7 @@ def main():
             "status": "running",
             "started": ts,
             "command": " ".join(["train_spin.py"] + sys.argv[1:]),
+            "git_hash": git_hash,
         }, f, indent=2)
 
     flow_end  = args.flow_warmup
@@ -448,12 +459,6 @@ def main():
     log(f"Saved checkpoints to {ckpt_dir}")
 
     # ── run_info (overwrite with full info on completion) ─────────────────────
-    import subprocess
-    try:
-        git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
-                                           text=True, stderr=subprocess.DEVNULL).strip()
-    except subprocess.CalledProcessError:
-        git_hash = "unknown"
     with open(run_dir / f"run_info_v{args.version}_{ts}.json", "w") as f:
         json.dump({
             "run": args.run, "version": args.version,
