@@ -2,9 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**This file and `experiments.md` are untracked from git** (see the note at the bottom) — they're
+standing instructions and experiment bookkeeping that apply across every branch, not code tied to one
+branch's history. Edit them directly; there is one physical copy per checkout, and it is not affected
+by `git checkout`.
+
 ## What this project is
 
-SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascular SBI. Trains paired generators G_sr (sim→real) and G_rs (real→sim) on raw observations (4 pressure waveforms + 5 scalars). At inference: x_real → G_rs → encoder → flow → posterior. Builds on the frozen v3 encoder+flow from `cv-dann-sbi`.
+SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascular SBI. Builds on the
+frozen v3 encoder+flow from `cv-dann-sbi`. Two architectural lines, on separate branches:
+
+- **`main` / `exp/wdgrl-grl`** — raw-observation-space translation. Paired generators G_sr (sim→real)
+  and G_rs (real→sim) operate on raw observations (4 pressure waveforms + 5 scalars), one shared
+  encoder+flow. At inference: x_real → G_rs → encoder → flow → posterior.
+- **`exp/latent-cycle-wdgrl`** — latent-space translation. Two separate encoders (E_sim, E_real);
+  G_sr/G_rs are small residual MLPs mapping between their 128-dim latent spaces instead of operating
+  on raw waveforms. At inference: x_real → E_real → G_rs → flow → posterior. See `experiments.md` for
+  gradient-routing design (which parameters get task/adversarial/cyc/id gradient).
 
 ## Relationship to cv-dann-sbi
 
@@ -33,7 +47,7 @@ SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascul
 
 Inherited from cv-dann-sbi: version numbers are assigned only when a run survives evaluation. Git branches (`exp/<what-you're-testing>`) for code changes; hyperparameter sweeps commit to main.
 
-**See `experiments.md`** for the full run↔branch↔version bookkeeping table (no results there, just which run/config corresponds to which version label). Current state: `exp-v1c_spin`'s rebalanced rerun (`--lam-cyc 2 --lam-id 1`, on `exp/wave-only-info-clamp`, merged to `main`) is retroactively **v2a** — not renamed on disk, just the documented version label. `exp/wdgrl-grl`'s `exp-v2b_spin` (WDGRL critics replacing the hinge-loss discriminator) is being tested against it as **v2b**; if it wins, it's promoted to **v3** (again, no file renaming — the run directory stays `exp-v2b_spin`, only the version label changes in docs).
+**See `experiments.md`** for the full run↔branch↔version bookkeeping table (no results there, just which run/config corresponds to which version label). Current state: `exp-v1c_spin`'s rebalanced rerun (`--lam-cyc 2 --lam-id 1`, on `exp/wave-only-info-clamp`, merged to `main`) is retroactively **v2a** — not renamed on disk, just the documented version label. Two candidates are being tested against it: `exp/wdgrl-grl`'s `exp-v2b_spin` (WDGRL critics replacing the hinge-loss discriminator, same raw-observation architecture) and `exp/latent-cycle-wdgrl`'s `exp-v3_spin` (a structurally different latent-space architecture — see `experiments.md` for why it's numbered v3 rather than v2c). Whichever wins gets promoted to the next open version label; run directories are never renamed to reflect this.
 
 **Run directories and file names are never renamed for versioning** — `exp-v1c_spin` stays `exp-v1c_spin` even though it's conceptually v2a. The run name is a historical record of when/how it was launched; the version label is a separate, retroactively-assigned judgment about whether it survived evaluation.
 
@@ -43,12 +57,14 @@ Inherited from cv-dann-sbi: version numbers are assigned only when a run survive
 - **`eval_common.py`'s `run_posterior_inference` had an extra `np.clip`** on the final posterior mean that isn't in the original notebooks — silently pulled degenerate (zero-acceptance) patients' means back to the prior boundary instead of leaving them as-is. Fixed in both `cv-sbi-spin` and `cv-dann-sbi`'s `eval_common.py`. Verified against `cv-dann-sbi`'s actual notebook output after the fix — numbers matched almost exactly.
 - **`GradientReversalLayer` is not used for WDGRL, in either repo.** Tried it in `exp-v2b_spin` attempt 1; checked `cv-dann-sbi/train_joint.py` directly and confirmed its `GradientReversalLayer` class is defined but unused there too — the actual mechanism in both repos is two separately-written loss expressions with opposite signs on the same critic-score term (mathematically identical to GRL, simpler code, no custom autograd `Function`). Don't reintroduce GRL without a specific reason — it was tried and reverted.
 - **Adversarial training here needs gradient clipping.** `exp-v2b_spin` attempt 1 (no clipping) diverged catastrophically at epoch 362 (`w1_R` reached ~10¹⁶ in a single epoch). `max_norm=1.0` clipping added to all three optimizer steps (critic, generator, posterior), matching `cv-dann-sbi/train_joint.py`'s existing practice — don't remove this for a future variant without a good reason.
+- **Never `git checkout` a branch in `~/projects/cv-sbi-spin/` on adamant while a training run is still using that checkout.** Doesn't affect an already-running process (Python has the code loaded in memory), but corrupts that run's `run_info.json`'s `git_hash`, which is re-read from `HEAD` fresh at completion. `exp-v2b_spin` attempt 3's checkout was switched away and back while it was still running (epoch 136/400) — caught and reverted before it finished, no `git_hash` corruption in the end. When two branches need to train concurrently, use a `git worktree` instead (e.g. `~/projects/cv-sbi-spin-latent-cycle-wdgrl/`, with `.venv`/`norm_stats.json` symlinked in) rather than switching branches in the shared checkout.
 
 ## Git conventions
 
 - Never add `Co-Authored-By: Claude` or any AI authorship trailer to commit messages.
 - Always commit before running a full experiment.
 - Git runs only on local Mac — never commit from adamant.
+- **`CLAUDE.md` and `experiments.md` are untracked** (in `.gitignore`) — they're shared, standing docs read the same way regardless of which branch is checked out. Don't `git add` them; edit in place. A new `git worktree` (e.g. for concurrent training on a second branch) won't get these files automatically since they're untracked — copy or symlink them in from an existing checkout.
 
 ## Training run conventions
 
