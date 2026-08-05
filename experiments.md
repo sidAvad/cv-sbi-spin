@@ -14,7 +14,7 @@ version numbers. No results/findings here; those live in `results/cv-sbi-spin/<r
 | `exp-v1c_spin` (rerun, same run name) | `exp/wave-only-info-clamp` | same flags, rebalanced `--lam-cyc 2 --lam-id 1` | **v2a** (retroactive; not renamed on disk) | done, 400 ep — no collapse |
 | `exp-v2b_spin` (attempt 1) | `exp/wdgrl-grl` | WDGRL critics (`n_critic=5`, `gp_weight=10.0`) + `GradientReversalLayer` for the generator step, `--grl-alpha 1.0 --adv-ramp 50` | v2b (attempt 1, failed) | done, 400 ep — catastrophic divergence at epoch 362 (`w1_R` → 10¹⁶), no gradient clipping |
 | `exp-v2b_spin` (attempt 2, same run name) | `exp/wdgrl-grl` | same WDGRL critics, `GradientReversalLayer` **removed** — generator step reverted to direct `-D(fake).mean()` (matches `cv-dann-sbi`'s actual mechanism, confirmed by reading `train_joint.py`), `--lam-adv-max 1.0 --adv-ramp 50`, gradient clipping (`max_norm=1.0`) added to all three optimizer steps | v2b (attempt 2) | done, 400 ep — no divergence, but large epoch-to-epoch noise in `L_adv`/`loss_G`; real-patient eval showed 1.7% posterior acceptance and 90% CI coverage of 0.05–0.07 (see Tuning notes) |
-| `exp-v2b_spin` (attempt 3, same run name) | `exp/wdgrl-grl` | `--lam-adv-max 0.2` (was 1.0), `--lr-gan 1e-4` (was 2e-4), critic inner loop redraws a fresh real batch via `sample_real()` each of the `n_critic` substeps (was one fixed batch reused across all 5 + the generator step) | v2b (attempt 3) | not yet run |
+| `exp-v2b_spin` (attempt 3, same run name) | `exp/wdgrl-grl` | `--lam-adv-max 0.2` (was 1.0), `--lr-gan 1e-4` (was 2e-4), critic inner loop redraws a fresh real batch via `sample_real()` each of the `n_critic` substeps (was one fixed batch reused across all 5 + the generator step) | v2b (attempt 3) | done, 400 ep — `npe_sim=12.22` (down from attempt 2's ~14.0); see Tuning notes |
 
 `exp/wave-only-info-clamp` merged into `main` (merge commit `e792b1f`) once v2a was confirmed stable —
 main now carries `--freeze-scalars`/`--clamp-info-gap`, the `checkpoints/<timestamp>/` convention, and
@@ -62,3 +62,11 @@ not a file move.
   logged magnitudes instead, to bring `lam_adv·L_adv` roughly in line with the other three terms
   combined. `lr_gan` and the critic-loop fresh-batch resampling *were* brought in line with
   `cv-dann-sbi`, since those aren't loss-composition-dependent.
+- **`exp-v2b_spin` attempt 3, final result**: finished 400 epochs at `npe_sim=12.22` — a real
+  improvement over attempt 2's converged ~14.0, and now ahead of v2a. `L_adv` is still visibly noisy
+  epoch-to-epoch even with the rebalanced lambda (final few epochs: 10.13, 14.98, 5.78) — better than
+  attempt 2 but not fully resolved. `w1_R`/`w1_S` (the actual W1 distance estimate, as opposed to the
+  noisier `L_adv`) stayed small and centered near zero throughout, consistent with a converged,
+  non-diverging critic. Real-patient eval (acceptance rate, calibration) not yet re-run for this
+  attempt — attempt 2's numbers (1.7% acceptance, 90% CI coverage 0.05–0.07) should not be assumed to
+  carry over given the training-curve improvement.

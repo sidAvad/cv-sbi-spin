@@ -4,7 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascular SBI. Trains paired generators G_sr (sim→real) and G_rs (real→sim) on raw observations (4 pressure waveforms + 5 scalars). At inference: x_real → G_rs → encoder → flow → posterior. Builds on the frozen v3 encoder+flow from `cv-dann-sbi`.
+SPIN (Simulation-to-Patient Image-to-Image translation Network) for cardiovascular SBI. This branch
+(`exp/wdgrl-grl`, off `main`) does raw-observation-space translation: paired generators G_sr (sim→real)
+and G_rs (real→sim) operate on raw observations (4 pressure waveforms + 5 scalars), one shared
+encoder+flow. At inference: x_real → G_rs → encoder → flow → posterior.
+
+A second, structurally different line lives on `exp/latent-cycle-wdgrl`: latent-space translation with
+two separate encoders (E_sim, E_real) and small residual-MLP generators mapping between their 128-dim
+latent spaces instead of raw waveforms. See that branch's `CLAUDE.md`/`experiments.md` for details.
 
 ## Relationship to cv-dann-sbi
 
@@ -43,6 +50,7 @@ Inherited from cv-dann-sbi: version numbers are assigned only when a run survive
 - **`eval_common.py`'s `run_posterior_inference` had an extra `np.clip`** on the final posterior mean that isn't in the original notebooks — silently pulled degenerate (zero-acceptance) patients' means back to the prior boundary instead of leaving them as-is. Fixed in both `cv-sbi-spin` and `cv-dann-sbi`'s `eval_common.py`. Verified against `cv-dann-sbi`'s actual notebook output after the fix — numbers matched almost exactly.
 - **`GradientReversalLayer` is not used for WDGRL, in either repo.** Tried it in `exp-v2b_spin` attempt 1; checked `cv-dann-sbi/train_joint.py` directly and confirmed its `GradientReversalLayer` class is defined but unused there too — the actual mechanism in both repos is two separately-written loss expressions with opposite signs on the same critic-score term (mathematically identical to GRL, simpler code, no custom autograd `Function`). Don't reintroduce GRL without a specific reason — it was tried and reverted.
 - **Adversarial training here needs gradient clipping.** `exp-v2b_spin` attempt 1 (no clipping) diverged catastrophically at epoch 362 (`w1_R` reached ~10¹⁶ in a single epoch). `max_norm=1.0` clipping added to all three optimizer steps (critic, generator, posterior), matching `cv-dann-sbi/train_joint.py`'s existing practice — don't remove this for a future variant without a good reason.
+- **Never `git checkout` a branch in `~/projects/cv-sbi-spin/` on adamant while a training run is still using that checkout.** Doesn't affect an already-running process (Python has the code loaded in memory), but corrupts that run's `run_info.json`'s `git_hash`, which is re-read from `HEAD` fresh at completion. `exp-v2b_spin` attempt 3's checkout was switched away and back while it was still running (epoch 136/400) — caught and reverted before it finished, no `git_hash` corruption in the end. When two branches need to train concurrently, use a `git worktree` instead (e.g. `~/projects/cv-sbi-spin-latent-cycle-wdgrl/`, with `.venv`/`norm_stats.json` symlinked in) rather than switching branches in the shared checkout.
 
 ## Git conventions
 
