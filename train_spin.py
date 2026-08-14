@@ -48,6 +48,57 @@ endpoint after G_rs has had a chance to launder it -- see experiments.csv/the
 session notes this design came out of) but both now sit in the system; noted,
 not considered a problem.
 
+v3b: exp-v3_spin trained cleanly through ~ep396 then diverged catastrophically
+at ep397-399 (L_adv/L_cyc/L_id/hf_rs/w1_S all spiked to the millions), mostly
+recovering by ep400. Diagnosis: npe_sim and npe_real (both independent of
+G_rs) stayed completely normal throughout -- every exploding quantity passes
+through G_rs regardless of input, pointing at G_rs's own weights becoming
+numerically pathological, not a bad-input cascade from G_sr/E_real. Three
+changes in response:
+
+  1. Dropped hf_rs from the loss (still computed/logged, just not weighted
+     in). Its original motivation -- guarding a direct task anchor against
+     steganographic smuggling -- never applied to G_rs (which has no direct
+     task anchor to smuggle through); it was applied there symmetrically
+     rather than for a real reason, and is a plausible (unconfirmed)
+     contributor to G_rs's instability. hf_sr is kept -- G_sr's anchor is
+     real and the threat model still applies there.
+
+  2. Mixup on the critic's real-batch sampling (--use-mixup, Beta(alpha,alpha)
+     interpolation between random real-patient pairs) -- ported from
+     cv-dann-sbi/train_joint.py's proven v3 recipe, never previously used in
+     this project. Augments the small (802-patient) real-side critic data so
+     D_R/D_S don't just memorize the exact patient set.
+
+  3. Scalar realignment for E_real only. E_real's scalar input was always
+     genuine sim scalars passed through unchanged (G_sr is wave_only, never
+     touches them) -- meaning E_real, despite its name, never saw a real-
+     patient scalar value during training. Real scalars ARE already
+     normalized (RealBeatsDataset z-scores them with the same sim-fit
+     norm_stats.json constants ReducedCVDataset uses), but that only
+     guarantees consistent units, not matching distributions -- if the real
+     population's true mean/spread differs from sim's, real data won't come
+     out centered at 0/std 1 the way sim's own z-scored values do by
+     construction. Fix: a deterministic, per-sample affine rescale of sim
+     scalars (already z-scored) to match the real population's empirical
+     mean/std in that same normalized space, applied ONLY when constructing
+     E_real's input (E_sim, G_sr/G_rs, D_R/D_S all continue to see the
+     original un-rescaled scalars). Deliberately narrow in scope: giving each
+     domain its own *foundational* normalization was tried in cv-dann-sbi's
+     v3b and made things worse ("same physical value maps to different
+     normalized inputs depending on population stats, introducing an input-
+     level domain gap") -- this only touches E_real's training-time input,
+     not the shared representation used everywhere else, so the same failure
+     mode shouldn't apply, but it's the same category of risk and worth
+     watching for.
+
+Also fixed: D_R/D_S were never saved in checkpoints (only encoder_sim/flow_sim/
+encoder_real/flow_real/G_sr/G_rs) -- --resume would have restarted the critics
+from scratch while generators resumed already-trained, giving generators a
+free adversarial pass until critics relearned. Now saved/loaded like everything
+else; --resume falls back to scratch-critics with a warning if an older
+checkpoint predates this fix.
+
 Schedule (per v2c):
   Phase 0  flow-warmup   (ep 1-2)    E_sim/flow_sim's flow trains, encoder frozen
   Phase 1  enc-warmup    (ep 3-12)   E_sim trains, flow_sim frozen
@@ -113,6 +164,36 @@ def gradient_penalty(disc_fn, x_fake, x_real, device):
     return ((grads.norm(2, dim=1) - 1) ** 2).mean()
 
 
+def mixup_real(real_beats: torch.Tensor, n: int, alpha: float, device) -> torch.Tensor:
+    """
+    Beta(alpha,alpha)-interpolated pairs of real patients -- augments the
+    critic's real-side training data so it doesn't just memorize the (small,
+    802-patient) real set. Ported from cv-dann-sbi/train_joint.py's proven v3
+    recipe; never previously used in this project (v3b).
+    """
+    idx_i = torch.randint(0, len(real_beats), (n,), device=device)
+    idx_j = torch.randint(0, len(real_beats), (n,), device=device)
+    lam   = torch.distributions.Beta(alpha, alpha).sample((n,)).to(device).unsqueeze(1)
+    return lam * real_beats[idx_i] + (1 - lam) * real_beats[idx_j]
+
+
+def realign_scalars_to_real(x: torch.Tensor, wave_dim: int,
+                            sim_mean, sim_std, real_mean, real_std) -> torch.Tensor:
+    """
+    Re-scale a (waves, scalars) tensor's scalar portion (already z-scored with
+    the shared sim-fit norm_stats.json constants) to match the real
+    population's empirical mean/std in that same normalized space. A
+    deterministic, per-sample affine transform of that sample's OWN scalars
+    (not a swap with a different patient), so theta correspondence stays
+    exact. Only used when constructing E_real's input (v3b) -- see module
+    docstring for why the scope is deliberately this narrow.
+    """
+    waves   = x[:, :wave_dim]
+    scalars = x[:, wave_dim:]
+    scalars_realigned = (scalars - sim_mean) / sim_std * real_std + real_mean
+    return torch.cat([waves, scalars_realigned], dim=1)
+
+
 def high_freq_penalty(delta_wave: torch.Tensor, kernel_size: int) -> torch.Tensor:
     """
     delta_wave: (B, N_REDUCED_CHANNELS, T) -- a generator's own residual
@@ -132,7 +213,7 @@ def high_freq_penalty(delta_wave: torch.Tensor, kernel_size: int) -> torch.Tenso
 
 def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                    x_s, x_r, theta, lam_cyc, lam_id, lam_info, lam_adv, lam_real, lam_hf,
-                   hf_kernel, wave_only=False, clamp_info_gap=False):
+                   hf_kernel, scalar_stats, wave_only=False, clamp_info_gap=False):
     """
     Generator step: update G_sr and G_rs.
 
@@ -147,9 +228,11 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                     generator only when translated reals are harder than pure sims.
                     Applies to the E_sim round-trip term only (npe_srs); the new
                     E_real anchor (L_real) is unclamped -- see module docstring.
+    scalar_stats: (sim_mean, sim_std, real_mean, real_std) for realign_scalars_to_real,
+                  applied only to E_real's input (v3b) -- see module docstring.
 
     L_G = lam_adv*L_adv + lam_cyc*L_cyc + lam_id*L_id + lam_info*L_info
-        + lam_real*L_real + lam_hf*(hf_sr + hf_rs)
+        + lam_real*L_real + lam_hf*hf_sr   (hf_rs dropped in v3b, still logged)
     """
     def _gen(G, x):
         """Apply generator, routing scalars around it when wave_only."""
@@ -196,15 +279,19 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
     else:
         L_info = torch.zeros(1, device=x_s.device).squeeze()
 
-    # Direct real-side anchor (E_real/flow_real, new) -- gradient reaches G_sr
-    # only (x_rs/G_rs never appear in this term at all)
+    # Direct real-side anchor (E_real/flow_real) -- gradient reaches G_sr
+    # only (x_rs/G_rs never appear in this term at all). x_sr's scalar portion
+    # is realigned toward real scalar statistics before E_real sees it (v3b) --
+    # E_sim/D_R/D_S/x_srs (round trip) all continue to use the un-rescaled x_sr.
     if lam_real > 0:
-        L_real = -flow_real.log_prob(theta, condition=E_real(x_sr)).mean()
+        sim_mean, sim_std, real_mean, real_std = scalar_stats
+        x_sr_for_real = realign_scalars_to_real(x_sr, _WAVE_DIM, sim_mean, sim_std, real_mean, real_std)
+        L_real = -flow_real.log_prob(theta, condition=E_real(x_sr_for_real)).mean()
     else:
         L_real = torch.zeros(1, device=x_s.device).squeeze()
 
-    # High-frequency residual penalty (new) -- each generator's own residual,
-    # wave portion only (scalars bypass G entirely under wave_only)
+    # High-frequency residual penalty -- G_sr's own residual only (v3b dropped
+    # hf_rs from the loss, see module docstring; still computed/logged for both).
     if lam_hf > 0:
         delta_sr_wave = (x_sr - x_s)[:, :_WAVE_DIM].view(-1, N_REDUCED_CHANNELS, T)
         delta_rs_wave = (x_rs - x_r)[:, :_WAVE_DIM].view(-1, N_REDUCED_CHANNELS, T)
@@ -215,7 +302,7 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
         hf_rs = torch.zeros(1, device=x_s.device).squeeze()
 
     loss = (lam_adv * L_adv + lam_cyc * L_cyc + lam_id * L_id + lam_info * L_info
-            + lam_real * L_real + lam_hf * (hf_sr + hf_rs))
+            + lam_real * L_real + lam_hf * hf_sr)
 
     with torch.no_grad():
         delta   = (x_sr - x_s).abs()
@@ -364,6 +451,12 @@ def main():
                         help="WDGRL: target weight on the generator's adversarial term (ramped)")
     parser.add_argument("--adv-ramp",     type=int,   default=50,
                         help="Joint epochs over which lam_adv ramps 0→lam_adv_max")
+    parser.add_argument("--use-mixup",    action="store_true",
+                        help="v3b: Beta(alpha,alpha)-interpolate real patient pairs for the "
+                             "critic's real-batch sampling, instead of raw draws -- ported from "
+                             "cv-dann-sbi/train_joint.py's proven v3 recipe")
+    parser.add_argument("--mixup-alpha",  type=float, default=0.2,
+                        help="Beta distribution concentration for --use-mixup")
     parser.add_argument("--batch-size",   type=int, default=512)
     parser.add_argument("--lr-npe",       type=float, default=1e-4)
     parser.add_argument("--lr-gan",       type=float, default=1e-4)
@@ -424,9 +517,23 @@ def main():
     real_dl = DataLoader(real_ds, batch_size=args.batch_size, sampler=real_sampler,
                          num_workers=0, pin_memory=True, drop_last=True)
     log(f"Real beats: {len(real_ds)}  (oversampled to ~{len(sim_ds)} per epoch)")
+    real_beats_gpu = real_ds.x.to(device)  # small (802, 809); kept resident for mixup_real
 
     log("Collecting theta stats for flow...")
     theta_all = sim_ds.theta[:min(10_000, len(sim_ds))]
+
+    # v3b: scalar realignment stats for E_real's input only -- see module docstring.
+    # Computed once from the full loaded populations, both already z-scored with the
+    # same shared sim-fit norm_stats.json constants (RealBeatsDataset/ReducedCVDataset).
+    sim_scalar_mean  = sim_ds.x[:, _WAVE_DIM:].mean(dim=0).to(device)
+    sim_scalar_std   = sim_ds.x[:, _WAVE_DIM:].std(dim=0).to(device) + 1e-8
+    real_scalar_mean = real_ds.x[:, _WAVE_DIM:].mean(dim=0).to(device)
+    real_scalar_std  = real_ds.x[:, _WAVE_DIM:].std(dim=0).to(device) + 1e-8
+    scalar_stats = (sim_scalar_mean, sim_scalar_std, real_scalar_mean, real_scalar_std)
+    log(f"Scalar realignment (E_real only): sim mean={sim_scalar_mean.tolist()}  "
+        f"std={sim_scalar_std.tolist()}")
+    log(f"                                  real mean={real_scalar_mean.tolist()}  "
+        f"std={real_scalar_std.tolist()}")
 
     # ── Models ────────────────────────────────────────────────────────────────
     E_sim     = LipschitzEncoder(latent_dim=args.latent_dim).to(device)
@@ -450,7 +557,14 @@ def main():
         flow_real = torch.load(resume_dir / "flow_real.pt", map_location=device, weights_only=False)
         G_sr.load_state_dict(torch.load(resume_dir / "G_sr.pt", map_location=device, weights_only=True))
         G_rs.load_state_dict(torch.load(resume_dir / "G_rs.pt", map_location=device, weights_only=True))
-        log(f"Resumed from checkpoints in {resume_dir}")
+        if (resume_dir / "D_R.pt").exists():
+            D_R.load_state_dict(torch.load(resume_dir / "D_R.pt", map_location=device, weights_only=True))
+            D_S.load_state_dict(torch.load(resume_dir / "D_S.pt", map_location=device, weights_only=True))
+            log(f"Resumed from checkpoints in {resume_dir} (including D_R/D_S)")
+        else:
+            log(f"Resumed from checkpoints in {resume_dir} -- D_R/D_S NOT found (checkpoint predates "
+                f"critic saving), starting critics from scratch. Expect a rocky adjustment period "
+                f"while they relearn against already-trained generators.")
 
     log(f"E_sim/E_real params: {sum(p.numel() for p in E_sim.parameters()):,} each")
     log(f"G_sr/G_rs params:  {sum(p.numel() for p in G_sr.parameters()):,} each")
@@ -459,7 +573,8 @@ def main():
         f"lam_adv_max={args.lam_adv_max} (ramped over {args.adv_ramp} joint epochs)  "
         f"grad_clip_norm=1.0")
     log(f"E_real anchor: lam_real_max={args.lam_real_max}  real_ramp={args.real_ramp}")
-    log(f"High-freq residual penalty: lam_hf={args.lam_hf}  hf_kernel={args.hf_kernel}")
+    log(f"High-freq residual penalty (G_sr only, v3b): lam_hf={args.lam_hf}  hf_kernel={args.hf_kernel}")
+    log(f"Mixup (v3b): use_mixup={args.use_mixup}  mixup_alpha={args.mixup_alpha}")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
     opt_G   = torch.optim.Adam(
@@ -525,6 +640,8 @@ def main():
         real_iter = iter(real_dl)
 
         def sample_real(n):
+            if args.use_mixup:
+                return mixup_real(real_beats_gpu, n, args.mixup_alpha, device)
             idx = torch.randint(0, len(real_ds), (n,))
             return real_ds.x[idx].to(device)
 
@@ -566,7 +683,7 @@ def main():
                 G_loss, G_info = loss_generator(
                     G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                     x_s, x_r, theta, args.lam_cyc, args.lam_id, lam_info_G, lam_adv,
-                    lam_real, args.lam_hf, args.hf_kernel,
+                    lam_real, args.lam_hf, args.hf_kernel, scalar_stats,
                     wave_only=args.freeze_scalars,
                     clamp_info_gap=args.clamp_info_gap,
                 )
@@ -616,6 +733,9 @@ def main():
                         x_sr_detached = torch.cat([waves_sr, x_s[:, _WAVE_DIM:]], dim=1)
                     else:
                         x_sr_detached = G_sr(x_s)
+                    x_sr_detached = realign_scalars_to_real(
+                        x_sr_detached, _WAVE_DIM, *scalar_stats,
+                    )
 
                 real_loss, real_info = loss_real_posterior(E_real, flow_real, x_sr_detached, theta)
                 real_loss.backward()
@@ -669,6 +789,8 @@ def main():
     torch.save(flow_real,             ckpt_dir / "flow_real.pt")
     torch.save(G_sr.state_dict(),     ckpt_dir / "G_sr.pt")
     torch.save(G_rs.state_dict(),     ckpt_dir / "G_rs.pt")
+    torch.save(D_R.state_dict(),      ckpt_dir / "D_R.pt")
+    torch.save(D_S.state_dict(),      ckpt_dir / "D_S.pt")
     log(f"Saved checkpoints to {ckpt_dir}")
 
     # ── run_info (overwrite with full info on completion) ─────────────────────
@@ -691,12 +813,16 @@ def main():
                 "lam_info_max": args.lam_info_max,
                 "lam_real_max": args.lam_real_max,
                 "lam_hf": args.lam_hf, "hf_kernel": args.hf_kernel,
+                "hf_applies_to": "G_sr only (v3b)",
             },
             "flags": {
                 "freeze_scalars": args.freeze_scalars,
                 "clamp_info_gap": args.clamp_info_gap,
                 "no_info_in_G": args.no_info_in_G,
+                "use_mixup": args.use_mixup,
             },
+            "mixup_alpha": args.mixup_alpha,
+            "scalar_realignment": "E_real only (v3b)",
             "wdgrl": {
                 "n_critic": args.n_critic,
                 "gp_weight": args.gp_weight,
