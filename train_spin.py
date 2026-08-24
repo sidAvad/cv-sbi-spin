@@ -70,27 +70,27 @@ changes in response:
      this project. Augments the small (802-patient) real-side critic data so
      D_R/D_S don't just memorize the exact patient set.
 
-  3. Scalar realignment for E_real only. E_real's scalar input was always
-     genuine sim scalars passed through unchanged (G_sr is wave_only, never
-     touches them) -- meaning E_real, despite its name, never saw a real-
-     patient scalar value during training. Real scalars ARE already
-     normalized (RealBeatsDataset z-scores them with the same sim-fit
-     norm_stats.json constants ReducedCVDataset uses), but that only
-     guarantees consistent units, not matching distributions -- if the real
-     population's true mean/spread differs from sim's, real data won't come
-     out centered at 0/std 1 the way sim's own z-scored values do by
-     construction. Fix: a deterministic, per-sample affine rescale of sim
-     scalars (already z-scored) to match the real population's empirical
-     mean/std in that same normalized space, applied ONLY when constructing
-     E_real's input (E_sim, G_sr/G_rs, D_R/D_S all continue to see the
-     original un-rescaled scalars). Deliberately narrow in scope: giving each
-     domain its own *foundational* normalization was tried in cv-dann-sbi's
-     v3b and made things worse ("same physical value maps to different
-     normalized inputs depending on population stats, introducing an input-
-     level domain gap") -- this only touches E_real's training-time input,
-     not the shared representation used everywhere else, so the same failure
-     mode shouldn't apply, but it's the same category of risk and worth
-     watching for.
+  3. (An earlier attempt at this v3b also added a scalar realignment step for
+     E_real's input here -- that attempt was killed off and its outputs/
+     results deleted. It was the leading suspect for why its canonical
+     inference route (x_real -> G_sr -> E_real/flow_real) regressed sharply on
+     Eap/Cas/Ras versus v3 despite Rap holding steady and coverage staying
+     poor on both; see experiments.csv. This v3b does not include it --
+     reverting isolates that variable before trying the decoupled gradient
+     clipping below, rather than compounding changes the way v3 -> the earlier
+     v3b attempt did.)
+
+This v3b (rerun after the earlier attempt above): reverts the scalar
+realignment described above and adds decoupled gradient clipping -- G_sr and
+G_rs now get separate clip_grad_norm_ calls instead of one combined-norm call
+over both. Motivation: v3's ep397-399 divergence traced specifically to
+G_rs's own weights going numerically pathological while G_sr/E_sim/E_real
+stayed normal throughout -- a combined clip rescales both generators'
+gradients by the same factor when the combined norm exceeds the threshold, so
+G_rs's exploding gradient was suppressing G_sr's own (unrelated, healthy)
+gradient by the same amount rather than being isolated. Keeps the hf_rs drop
+(never applied to G_rs's non-existent direct anchor to begin with) and the
+D_R/D_S checkpointing fix below, both independently justified.
 
 Also fixed: D_R/D_S were never saved in checkpoints (only encoder_sim/flow_sim/
 encoder_real/flow_real/G_sr/G_rs) -- --resume would have restarted the critics
@@ -177,23 +177,6 @@ def mixup_real(real_beats: torch.Tensor, n: int, alpha: float, device) -> torch.
     return lam * real_beats[idx_i] + (1 - lam) * real_beats[idx_j]
 
 
-def realign_scalars_to_real(x: torch.Tensor, wave_dim: int,
-                            sim_mean, sim_std, real_mean, real_std) -> torch.Tensor:
-    """
-    Re-scale a (waves, scalars) tensor's scalar portion (already z-scored with
-    the shared sim-fit norm_stats.json constants) to match the real
-    population's empirical mean/std in that same normalized space. A
-    deterministic, per-sample affine transform of that sample's OWN scalars
-    (not a swap with a different patient), so theta correspondence stays
-    exact. Only used when constructing E_real's input (v3b) -- see module
-    docstring for why the scope is deliberately this narrow.
-    """
-    waves   = x[:, :wave_dim]
-    scalars = x[:, wave_dim:]
-    scalars_realigned = (scalars - sim_mean) / sim_std * real_std + real_mean
-    return torch.cat([waves, scalars_realigned], dim=1)
-
-
 def high_freq_penalty(delta_wave: torch.Tensor, kernel_size: int) -> torch.Tensor:
     """
     delta_wave: (B, N_REDUCED_CHANNELS, T) -- a generator's own residual
@@ -213,7 +196,7 @@ def high_freq_penalty(delta_wave: torch.Tensor, kernel_size: int) -> torch.Tenso
 
 def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                    x_s, x_r, theta, lam_cyc, lam_id, lam_info, lam_adv, lam_real, lam_hf,
-                   hf_kernel, scalar_stats, wave_only=False, clamp_info_gap=False):
+                   hf_kernel, wave_only=False, clamp_info_gap=False):
     """
     Generator step: update G_sr and G_rs.
 
@@ -228,8 +211,6 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                     generator only when translated reals are harder than pure sims.
                     Applies to the E_sim round-trip term only (npe_srs); the new
                     E_real anchor (L_real) is unclamped -- see module docstring.
-    scalar_stats: (sim_mean, sim_std, real_mean, real_std) for realign_scalars_to_real,
-                  applied only to E_real's input (v3b) -- see module docstring.
 
     L_G = lam_adv*L_adv + lam_cyc*L_cyc + lam_id*L_id + lam_info*L_info
         + lam_real*L_real + lam_hf*hf_sr   (hf_rs dropped in v3b, still logged)
@@ -280,13 +261,9 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
         L_info = torch.zeros(1, device=x_s.device).squeeze()
 
     # Direct real-side anchor (E_real/flow_real) -- gradient reaches G_sr
-    # only (x_rs/G_rs never appear in this term at all). x_sr's scalar portion
-    # is realigned toward real scalar statistics before E_real sees it (v3b) --
-    # E_sim/D_R/D_S/x_srs (round trip) all continue to use the un-rescaled x_sr.
+    # only (x_rs/G_rs never appear in this term at all)
     if lam_real > 0:
-        sim_mean, sim_std, real_mean, real_std = scalar_stats
-        x_sr_for_real = realign_scalars_to_real(x_sr, _WAVE_DIM, sim_mean, sim_std, real_mean, real_std)
-        L_real = -flow_real.log_prob(theta, condition=E_real(x_sr_for_real)).mean()
+        L_real = -flow_real.log_prob(theta, condition=E_real(x_sr)).mean()
     else:
         L_real = torch.zeros(1, device=x_s.device).squeeze()
 
@@ -522,19 +499,6 @@ def main():
     log("Collecting theta stats for flow...")
     theta_all = sim_ds.theta[:min(10_000, len(sim_ds))]
 
-    # v3b: scalar realignment stats for E_real's input only -- see module docstring.
-    # Computed once from the full loaded populations, both already z-scored with the
-    # same shared sim-fit norm_stats.json constants (RealBeatsDataset/ReducedCVDataset).
-    sim_scalar_mean  = sim_ds.x[:, _WAVE_DIM:].mean(dim=0).to(device)
-    sim_scalar_std   = sim_ds.x[:, _WAVE_DIM:].std(dim=0).to(device) + 1e-8
-    real_scalar_mean = real_ds.x[:, _WAVE_DIM:].mean(dim=0).to(device)
-    real_scalar_std  = real_ds.x[:, _WAVE_DIM:].std(dim=0).to(device) + 1e-8
-    scalar_stats = (sim_scalar_mean, sim_scalar_std, real_scalar_mean, real_scalar_std)
-    log(f"Scalar realignment (E_real only): sim mean={sim_scalar_mean.tolist()}  "
-        f"std={sim_scalar_std.tolist()}")
-    log(f"                                  real mean={real_scalar_mean.tolist()}  "
-        f"std={real_scalar_std.tolist()}")
-
     # ── Models ────────────────────────────────────────────────────────────────
     E_sim     = LipschitzEncoder(latent_dim=args.latent_dim).to(device)
     flow_sim  = build_flow_net(args.latent_dim, theta_all).to(device)
@@ -683,12 +647,18 @@ def main():
                 G_loss, G_info = loss_generator(
                     G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                     x_s, x_r, theta, args.lam_cyc, args.lam_id, lam_info_G, lam_adv,
-                    lam_real, args.lam_hf, args.hf_kernel, scalar_stats,
+                    lam_real, args.lam_hf, args.hf_kernel,
                     wave_only=args.freeze_scalars,
                     clamp_info_gap=args.clamp_info_gap,
                 )
                 G_loss.backward()
-                torch.nn.utils.clip_grad_norm_(list(G_sr.parameters()) + list(G_rs.parameters()), 1.0)
+                # v3b: decoupled per-generator clipping (was one combined-norm call over
+                # both G_sr and G_rs) -- v3's ep397-399 divergence traced specifically to
+                # G_rs's own weights going pathological while G_sr stayed normal; a combined
+                # clip would rescale G_sr's healthy gradient by the same factor as G_rs's
+                # exploding one instead of isolating the blowup to G_rs alone.
+                torch.nn.utils.clip_grad_norm_(G_sr.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(G_rs.parameters(), 1.0)
                 opt_G.step()
                 G_loss_sum  += G_loss.item()
                 adv_sum     += G_info["adv"]
@@ -733,9 +703,6 @@ def main():
                         x_sr_detached = torch.cat([waves_sr, x_s[:, _WAVE_DIM:]], dim=1)
                     else:
                         x_sr_detached = G_sr(x_s)
-                    x_sr_detached = realign_scalars_to_real(
-                        x_sr_detached, _WAVE_DIM, *scalar_stats,
-                    )
 
                 real_loss, real_info = loss_real_posterior(E_real, flow_real, x_sr_detached, theta)
                 real_loss.backward()
@@ -822,13 +789,12 @@ def main():
                 "use_mixup": args.use_mixup,
             },
             "mixup_alpha": args.mixup_alpha,
-            "scalar_realignment": "E_real only (v3b)",
             "wdgrl": {
                 "n_critic": args.n_critic,
                 "gp_weight": args.gp_weight,
                 "lam_adv_max": args.lam_adv_max,
                 "adv_ramp": args.adv_ramp,
-                "grad_clip_norm": 1.0,
+                "grad_clip_norm": "1.0, decoupled per-generator for G_sr/G_rs (v3b)",
             },
             "data": {
                 "n_sims": args.n_sims, "n_real_beats": len(real_ds),
