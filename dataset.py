@@ -39,16 +39,25 @@ class ReducedCVDataset(Dataset):
     """
     Returns (theta_infer, x) where:
       theta_infer : (24,)  — all params except HR
-      x           : (809,) — 4 z-scored waveforms (4*201) + 5 scalars
-                             scalars: MAP, SBP, DBP (via z-scored Pas), SV (via Vlv std), HR_z
+      x           : (809,) or (808,) if include_sv=False — 4 z-scored waveforms
+                    (4*201) + scalars: MAP, SBP, DBP (via z-scored Pas), [SV (via Vlv
+                    std) if include_sv], HR_z
 
-    All data preloaded into RAM at init. self.theta and self.x are accessible
+    include_sv=False drops SV from x entirely (shrinks the scalar tail from 5 to 4) --
+    for the --no-sv ablation, ported from cv-dann-sbi/train_joint.py's --no-sv. SV is
+    still computed and stored separately in self.sv (z-scored, same formula) regardless
+    of include_sv, so held-out ground truth remains available for the ablation's
+    reconstruct-and-recover-SV comparison even when it's excluded from x.
+
+    All data preloaded into RAM at init. self.theta, self.x, self.sv are accessible
     directly for theta stats collection etc.
     """
 
-    def __init__(self, data_dir, index_entries, stats, log=print):
+    def __init__(self, data_dir, index_entries, stats, log=print, include_sv: bool = True):
         w = stats["waves"]
         p = stats["parameters"]
+        self.include_sv = include_sv
+        obs_dim = OBS_DIM if include_sv else OBS_DIM - 1
 
         wave_mean = np.array([w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None]
         wave_std  = np.array([w[k]["std"]  for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None] + 1e-8
@@ -59,7 +68,8 @@ class ReducedCVDataset(Dataset):
 
         n = len(index_entries)
         theta_buf = np.empty((n, len(PARAM_KEYS_INFER)), dtype=np.float32)
-        x_buf     = np.empty((n, OBS_DIM),               dtype=np.float32)
+        x_buf     = np.empty((n, obs_dim),                dtype=np.float32)
+        sv_buf    = np.empty((n,),                        dtype=np.float32)
 
         handles = {}
         log_interval = max(1, n // 20)
@@ -82,9 +92,12 @@ class ReducedCVDataset(Dataset):
             vlv   = g["waves/Vlv"][:].astype(np.float32)
             sv    = (vlv.max() - vlv.min()) / vlv_std
             hr_z  = (hr_raw - hr_mean) / hr_std
+            sv_buf[i] = sv
 
             x_buf[i, :N_REDUCED_CHANNELS * T] = waves.ravel()
-            x_buf[i, N_REDUCED_CHANNELS * T:] = [pas_z.mean(), pas_z.max(), pas_z.min(), sv, hr_z]
+            scalars = [pas_z.mean(), pas_z.max(), pas_z.min(), sv, hr_z] if include_sv \
+                     else [pas_z.mean(), pas_z.max(), pas_z.min(), hr_z]
+            x_buf[i, N_REDUCED_CHANNELS * T:] = scalars
 
             if (i + 1) % log_interval == 0 or i == n - 1:
                 log(f"  sims {i + 1}/{n} ({100*(i+1)//n}%)")
@@ -94,6 +107,7 @@ class ReducedCVDataset(Dataset):
 
         self.theta = torch.from_numpy(theta_buf)
         self.x     = torch.from_numpy(x_buf)
+        self.sv    = torch.from_numpy(sv_buf)
 
     def __len__(self):
         return len(self.theta)
@@ -109,11 +123,19 @@ class RealBeatsDataset(Dataset):
     Each .h5 file = one patient; takes the first beat_* group.
     Same legacy normalization as ReducedCVDataset — shared sim-fitted affine map.
     All 802 beats preloaded into RAM at init (~2.5 MB).
+
+    include_sv=False drops SV from x (shrinks scalar tail 5->4), matching
+    ReducedCVDataset's --no-sv ablation support. self.sv (z-scored) is always stored
+    separately regardless of include_sv, self.file (patient filenames, no extension)
+    for identifying which patient a given row is when cross-referencing ground truth
+    SV later.
     """
 
-    def __init__(self, data_dir, stats, log=print):
+    def __init__(self, data_dir, stats, log=print, include_sv: bool = True):
         w = stats["waves"]
         p = stats["parameters"]
+        self.include_sv = include_sv
+        obs_dim = OBS_DIM if include_sv else OBS_DIM - 1
 
         wave_mean = np.array([w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None]
         wave_std  = np.array([w[k]["std"]  for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None] + 1e-8
@@ -125,7 +147,8 @@ class RealBeatsDataset(Dataset):
         import pathlib
         files = sorted(str(fp) for fp in pathlib.Path(data_dir).glob("*.h5"))
         n = len(files)
-        x_buf = np.empty((n, OBS_DIM), dtype=np.float32)
+        x_buf  = np.empty((n, obs_dim), dtype=np.float32)
+        sv_buf = np.empty((n,),         dtype=np.float32)
 
         for i, fpath in enumerate(files):
             with h5py.File(fpath, "r") as f:
@@ -140,12 +163,17 @@ class RealBeatsDataset(Dataset):
                 dbp_z = (float(g["summaries/dbp"][()]) - pas_mean) / pas_std
                 sv_z  = float(g["summaries/sv"][()]) / vlv_std
                 hr_z  = (float(g["parameters/HR"][()]) - hr_mean) / hr_std
+                sv_buf[i] = sv_z
 
                 x_buf[i, :N_REDUCED_CHANNELS * T] = waves.ravel()
-                x_buf[i, N_REDUCED_CHANNELS * T:] = [map_z, sbp_z, dbp_z, sv_z, hr_z]
+                scalars = [map_z, sbp_z, dbp_z, sv_z, hr_z] if include_sv \
+                         else [map_z, sbp_z, dbp_z, hr_z]
+                x_buf[i, N_REDUCED_CHANNELS * T:] = scalars
 
         log(f"  loaded {n} real beats")
-        self.x = torch.from_numpy(x_buf)
+        self.x    = torch.from_numpy(x_buf)
+        self.sv   = torch.from_numpy(sv_buf)
+        self.file = [pathlib.Path(fp).stem for fp in files]
 
     def __len__(self):
         return len(self.x)

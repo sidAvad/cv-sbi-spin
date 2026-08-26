@@ -72,10 +72,12 @@ class LipschitzEncoder(nn.Module):
         (256,                256, 3, 1),
     ]
 
-    def __init__(self, latent_dim: int = LATENT_DIM, sn_ceiling: float = 2.0):
+    def __init__(self, latent_dim: int = LATENT_DIM, sn_ceiling: float = 2.0,
+                 n_scalars: int = N_SCALARS):
         super().__init__()
         self.latent_dim = latent_dim
         self.sn_ceiling = sn_ceiling
+        self.n_scalars  = n_scalars
         self.wave_len   = N_REDUCED_CHANNELS * T
         feat_dim = self.CONV_LAYERS[-1][1]
 
@@ -87,7 +89,7 @@ class LipschitzEncoder(nn.Module):
             ]
         self.cnn          = nn.Sequential(*layers)
         self.scalar_projs = nn.ModuleList(
-            [_sn_ceiling(nn.Linear(1, feat_dim), sn_ceiling) for _ in range(N_SCALARS)]
+            [_sn_ceiling(nn.Linear(1, feat_dim), sn_ceiling) for _ in range(n_scalars)]
         )
         self.attn_pool = _sn_ceiling(nn.Linear(feat_dim, 1), sn_ceiling)
         self.proj      = _sn_ceiling(nn.Linear(feat_dim, latent_dim), sn_ceiling)
@@ -100,7 +102,7 @@ class LipschitzEncoder(nn.Module):
         return {
             "type": "LipschitzEncoder",
             "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
-            "input_scalars": "MAP, SBP, DBP, SV, HR_z",
+            "input_scalars": "MAP, SBP, DBP, HR_z" if self.n_scalars == 4 else "MAP, SBP, DBP, SV, HR_z",
             "latent_dim": self.latent_dim,
             "sn_ceiling": self.sn_ceiling,
             "n_params": sum(p.numel() for p in self.parameters()),

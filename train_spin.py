@@ -140,7 +140,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dataset import (
     ReducedCVDataset, RealBeatsDataset,
     load_stats, load_manifest,
-    PARAM_KEYS_INFER, N_REDUCED_CHANNELS, T,
+    PARAM_KEYS_INFER, N_REDUCED_CHANNELS, N_SCALARS, T,
 )
 
 _WAVE_DIM = N_REDUCED_CHANNELS * T  # 804
@@ -415,6 +415,12 @@ def main():
                              "the high-frequency remainder in the residual penalty")
     parser.add_argument("--freeze-scalars",  action="store_true",
                         help="Wave-only generators/discriminators; scalars bypass G and route directly to encoder")
+    parser.add_argument("--no-sv", action="store_true",
+                        help="Drop SV from the scalar tail entirely (4 scalars instead of 5) for both "
+                             "E_sim and E_real -- ported from cv-dann-sbi/train_joint.py's --no-sv. SV "
+                             "ground truth stays available separately (ReducedCVDataset.sv / "
+                             "RealBeatsDataset.sv) for the reconstruct-and-recover-SV ablation even "
+                             "though the model never sees it as input.")
     parser.add_argument("--clamp-info-gap", action="store_true",
                         help="L_info_G = relu(npe_srs - npe_sim): gradient to G only when gap > 0. "
                              "Applies to the E_sim round-trip term only, not the E_real anchor.")
@@ -482,27 +488,31 @@ def main():
     sim_root = Path(args.sim_data_root)
     manifest = load_manifest(sim_root / "manifest_train.json")
 
+    include_sv = not args.no_sv
+    n_scalars  = 4 if args.no_sv else N_SCALARS
+    log(f"--no-sv={args.no_sv}  (n_scalars={n_scalars} for E_sim/E_real)")
+
     log(f"Loading {args.n_sims} sim observations...")
     sim_ds = ReducedCVDataset(str(sim_root / "train"), manifest["index"][:args.n_sims], stats,
-                              log=log)
+                              log=log, include_sv=include_sv)
     sim_dl = DataLoader(sim_ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=0, pin_memory=True, drop_last=True)
 
     log(f"Loading real patient beats from {args.real_data}...")
-    real_ds = RealBeatsDataset(args.real_data, stats, log=log)
+    real_ds = RealBeatsDataset(args.real_data, stats, log=log, include_sv=include_sv)
     real_sampler = RandomSampler(real_ds, replacement=True, num_samples=len(sim_ds))
     real_dl = DataLoader(real_ds, batch_size=args.batch_size, sampler=real_sampler,
                          num_workers=0, pin_memory=True, drop_last=True)
     log(f"Real beats: {len(real_ds)}  (oversampled to ~{len(sim_ds)} per epoch)")
-    real_beats_gpu = real_ds.x.to(device)  # small (802, 809); kept resident for mixup_real
+    real_beats_gpu = real_ds.x.to(device)  # small (802, 808 or 809); kept resident for mixup_real
 
     log("Collecting theta stats for flow...")
     theta_all = sim_ds.theta[:min(10_000, len(sim_ds))]
 
     # ── Models ────────────────────────────────────────────────────────────────
-    E_sim     = LipschitzEncoder(latent_dim=args.latent_dim).to(device)
+    E_sim     = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
     flow_sim  = build_flow_net(args.latent_dim, theta_all).to(device)
-    E_real    = LipschitzEncoder(latent_dim=args.latent_dim).to(device)
+    E_real    = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
     flow_real = build_flow_net(args.latent_dim, theta_all).to(device)
     G_sr    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
     G_rs    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
@@ -787,7 +797,9 @@ def main():
                 "clamp_info_gap": args.clamp_info_gap,
                 "no_info_in_G": args.no_info_in_G,
                 "use_mixup": args.use_mixup,
+                "no_sv": args.no_sv,
             },
+            "n_scalars": n_scalars,
             "mixup_alpha": args.mixup_alpha,
             "wdgrl": {
                 "n_critic": args.n_critic,
