@@ -382,6 +382,18 @@ def make_log(run_dir: Path):
     return log, fh
 
 
+def save_checkpoint(ckpt_dir: Path, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S):
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(E_sim.state_dict(),    ckpt_dir / "encoder_sim.pt")
+    torch.save(flow_sim,              ckpt_dir / "flow_sim.pt")
+    torch.save(E_real.state_dict(),   ckpt_dir / "encoder_real.pt")
+    torch.save(flow_real,             ckpt_dir / "flow_real.pt")
+    torch.save(G_sr.state_dict(),     ckpt_dir / "G_sr.pt")
+    torch.save(G_rs.state_dict(),     ckpt_dir / "G_rs.pt")
+    torch.save(D_R.state_dict(),      ckpt_dir / "D_R.pt")
+    torch.save(D_S.state_dict(),      ckpt_dir / "D_S.pt")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -595,6 +607,8 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     end_epoch = args.start_epoch + args.max_epochs - 1
+    best_npe_real_val = float("inf")
+    best_npe_real_val_epoch = None
     for epoch in range(1, args.max_epochs + 1):
         abs_epoch = args.start_epoch + epoch - 1
 
@@ -756,6 +770,12 @@ def main():
                 npe_real_val = (-flow_real.log_prob(theta_val, condition=E_real(x_sr_val)).mean()).item()
             G_sr.train(); E_real.train(); flow_real.train()
 
+            if npe_real_val < best_npe_real_val:
+                best_npe_real_val = npe_real_val
+                best_npe_real_val_epoch = abs_epoch
+                best_ckpt_dir = run_dir / "checkpoints" / f"{ts}_best"
+                save_checkpoint(best_ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
+
         # ── Epoch logging ─────────────────────────────────────────────────
         nb = max(n_batches, 1)
         npe_sim  = enc_npe_sum / n_batches
@@ -795,16 +815,11 @@ def main():
 
     # ── Save checkpoints ──────────────────────────────────────────────────────
     ckpt_dir = run_dir / "checkpoints" / ts
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(E_sim.state_dict(),    ckpt_dir / "encoder_sim.pt")
-    torch.save(flow_sim,              ckpt_dir / "flow_sim.pt")
-    torch.save(E_real.state_dict(),   ckpt_dir / "encoder_real.pt")
-    torch.save(flow_real,             ckpt_dir / "flow_real.pt")
-    torch.save(G_sr.state_dict(),     ckpt_dir / "G_sr.pt")
-    torch.save(G_rs.state_dict(),     ckpt_dir / "G_rs.pt")
-    torch.save(D_R.state_dict(),      ckpt_dir / "D_R.pt")
-    torch.save(D_S.state_dict(),      ckpt_dir / "D_S.pt")
+    save_checkpoint(ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
     log(f"Saved checkpoints to {ckpt_dir}")
+    if best_npe_real_val < float("inf"):
+        log(f"Best npe_real_val={best_npe_real_val:.4f} at epoch {best_npe_real_val_epoch} "
+            f"-> {ckpt_dir}_best")
 
     # ── run_info (overwrite with full info on completion) ─────────────────────
     with open(run_dir / f"run_info_v{args.version}_{ts}.json", "w") as f:
