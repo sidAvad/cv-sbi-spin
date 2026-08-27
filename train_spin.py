@@ -391,6 +391,11 @@ def main():
     parser.add_argument("--sim-data-root", required=True)
     parser.add_argument("--real-data",    required=True)
     parser.add_argument("--n-sims",       type=int, required=True)
+    parser.add_argument("--n-val-sims",   type=int, default=2000,
+                        help="Held-out sims (from manifest_test.json, never trained on) used "
+                             "each epoch for a validation npe_real reading -- one extra no_grad "
+                             "batch/epoch, negligible cost vs the ~n_sims/batch_size training "
+                             "batches already run. Set 0 to disable.")
     parser.add_argument("--max-epochs",   type=int, default=400)
     parser.add_argument("--flow-warmup",  type=int, default=2)
     parser.add_argument("--enc-warmup",   type=int, default=10)
@@ -503,6 +508,14 @@ def main():
     real_sampler = RandomSampler(real_ds, replacement=True, num_samples=len(sim_ds))
     real_dl = DataLoader(real_ds, batch_size=args.batch_size, sampler=real_sampler,
                          num_workers=0, pin_memory=True, drop_last=True)
+
+    val_ds = None
+    if args.n_val_sims > 0:
+        manifest_test = load_manifest(sim_root / "manifest_test.json")
+        log(f"Loading {args.n_val_sims} held-out validation sims (manifest_test.json, "
+            f"never trained on)...")
+        val_ds = ReducedCVDataset(str(sim_root / "test"), manifest_test["index"][:args.n_val_sims],
+                                  stats, log=log, include_sv=include_sv)
     log(f"Real beats: {len(real_ds)}  (oversampled to ~{len(sim_ds)} per epoch)")
     real_beats_gpu = real_ds.x.to(device)  # small (802, 808 or 809); kept resident for mixup_real
 
@@ -576,7 +589,7 @@ def main():
     else:
         csv_path = run_dir / f"train_log_{ts}.csv"
         csv_fh   = open(csv_path, "w")
-        csv_fh.write("epoch,phase,npe_sim,npe_srs,gap,npe_real,L_adv,L_cyc,L_id,L_info_G,L_real_G,"
+        csv_fh.write("epoch,phase,npe_sim,npe_srs,gap,npe_real,npe_real_val,L_adv,L_cyc,L_id,L_info_G,L_real_G,"
                      "hf_sr,hf_rs,loss_G,w1_R,w1_S,gp_R,gp_S,loss_critic,delta_waves,delta_scal,"
                      "lam_info,lam_adv,lam_real\n")
 
@@ -722,6 +735,27 @@ def main():
 
             n_batches += 1
 
+        # ── Validation npe_real (held-out sims, never trained on) ───────────
+        # G_sr(x_val) -> encoder_real -> flow_real, same route as the real posterior step,
+        # but on manifest_test.json data. .eval() on all three so spectral-norm's power-
+        # iteration buffers (which only update `if self.training`) aren't perturbed by a
+        # batch that was never actually trained on; .train() restored right after so the
+        # rest of the script's behavior is unaffected.
+        npe_real_val = float("nan")
+        if val_ds is not None and phase == "joint":
+            G_sr.eval(); E_real.eval(); flow_real.eval()
+            with torch.no_grad():
+                val_idx   = torch.randint(0, len(val_ds), (min(args.batch_size, len(val_ds)),))
+                theta_val = val_ds.theta[val_idx].to(device)
+                x_val     = val_ds.x[val_idx].to(device)
+                if args.freeze_scalars:
+                    waves_sr_val = G_sr(x_val[:, :_WAVE_DIM])
+                    x_sr_val = torch.cat([waves_sr_val, x_val[:, _WAVE_DIM:]], dim=1)
+                else:
+                    x_sr_val = G_sr(x_val)
+                npe_real_val = (-flow_real.log_prob(theta_val, condition=E_real(x_sr_val)).mean()).item()
+            G_sr.train(); E_real.train(); flow_real.train()
+
         # ── Epoch logging ─────────────────────────────────────────────────
         nb = max(n_batches, 1)
         npe_sim  = enc_npe_sum / n_batches
@@ -746,11 +780,13 @@ def main():
 
         log(f"  ep {abs_epoch:3d}/{end_epoch}  [{phase}]"
             f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}  gap={gap:+.4f}  npe_real={npe_real:.4f}"
+            f"  npe_real_val={npe_real_val:.4f}"
             f"  L_adv={adv_e:.4f}  L_cyc={cyc_e:.4f}  L_id={id_e:.4f}  L_info={info_g_e:.4f}  L_real={real_g_e:.4f}"
             f"  hf_sr={hf_sr_e:.5f}  hf_rs={hf_rs_e:.5f}"
             f"  w1_R={w1_R_e:.4f}  w1_S={w1_S_e:.4f}  gp_R={gp_R_e:.4f}  gp_S={gp_S_e:.4f}"
             f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}  λ_adv={lam_adv:.3f}  λ_real={lam_real:.3f}")
         csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},{gap:.6f},{npe_real:.6f},"
+                     f"{npe_real_val:.6f},"
                      f"{adv_e:.6f},{cyc_e:.6f},{id_e:.6f},{info_g_e:.6f},{real_g_e:.6f},"
                      f"{hf_sr_e:.6f},{hf_rs_e:.6f},{G_loss_e:.6f},"
                      f"{w1_R_e:.6f},{w1_S_e:.6f},{gp_R_e:.6f},{gp_S_e:.6f},{critic_loss_e:.6f},"
@@ -809,7 +845,7 @@ def main():
                 "grad_clip_norm": "1.0, decoupled per-generator for G_sr/G_rs (v3b)",
             },
             "data": {
-                "n_sims": args.n_sims, "n_real_beats": len(real_ds),
+                "n_sims": args.n_sims, "n_val_sims": args.n_val_sims, "n_real_beats": len(real_ds),
                 "sim_data_root": args.sim_data_root, "real_data": args.real_data,
             },
         }, f, indent=2)
