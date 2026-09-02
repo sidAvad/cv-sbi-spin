@@ -132,6 +132,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
@@ -408,6 +409,16 @@ def main():
                              "each epoch for a validation npe_real reading -- one extra no_grad "
                              "batch/epoch, negligible cost vs the ~n_sims/batch_size training "
                              "batches already run. Set 0 to disable.")
+    parser.add_argument("--calib-every",  type=int, default=10,
+                        help="Compute real-patient Rap/Ras 90%% credible-interval coverage every N "
+                             "joint epochs and checkpoint on it (harmonic mean of closeness-to-"
+                             "nominal-0.90 for each). Rap/Ras have directly-measured ground truth "
+                             "(PVR/SVR) on real patients, unlike Cas/Eap -- so unlike npe_real_val "
+                             "(a sim-side proxy via G_sr(x_sim)), this measures calibration on the "
+                             "actual target population. Expensive (802 patients x "
+                             "--calib-n-samples flow samples each), hence not every epoch.")
+    parser.add_argument("--calib-n-samples", type=int, default=300,
+                        help="Posterior samples per real patient for the calibration checkpoint metric")
     parser.add_argument("--max-epochs",   type=int, default=400)
     parser.add_argument("--flow-warmup",  type=int, default=2)
     parser.add_argument("--enc-warmup",   type=int, default=10)
@@ -521,6 +532,13 @@ def main():
     real_dl = DataLoader(real_ds, batch_size=args.batch_size, sampler=real_sampler,
                          num_workers=0, pin_memory=True, drop_last=True)
 
+    rap_idx = PARAM_KEYS_INFER.index("Rap")
+    ras_idx = PARAM_KEYS_INFER.index("Ras")
+    real_gt_rap = real_ds.gt_rap  # (802,) physical units, directly measured (PVR)
+    real_gt_ras = real_ds.gt_ras  # (802,) physical units, directly measured (SVR)
+    rap_valid = ~np.isnan(real_gt_rap) & (real_gt_rap >= 0)
+    ras_valid = ~np.isnan(real_gt_ras) & (real_gt_ras >= 0)
+
     val_ds = None
     if args.n_val_sims > 0:
         manifest_test = load_manifest(sim_root / "manifest_test.json")
@@ -603,12 +621,12 @@ def main():
         csv_fh   = open(csv_path, "w")
         csv_fh.write("epoch,phase,npe_sim,npe_srs,gap,npe_real,npe_real_val,L_adv,L_cyc,L_id,L_info_G,L_real_G,"
                      "hf_sr,hf_rs,loss_G,w1_R,w1_S,gp_R,gp_S,loss_critic,delta_waves,delta_scal,"
-                     "lam_info,lam_adv,lam_real\n")
+                     "lam_info,lam_adv,lam_real,cov_rap,cov_ras,calib_score\n")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     end_epoch = args.start_epoch + args.max_epochs - 1
-    best_npe_real_val = float("inf")
-    best_npe_real_val_epoch = None
+    best_calib_score = -float("inf")
+    best_calib_epoch = None
     for epoch in range(1, args.max_epochs + 1):
         abs_epoch = args.start_epoch + epoch - 1
 
@@ -770,11 +788,53 @@ def main():
                 npe_real_val = (-flow_real.log_prob(theta_val, condition=E_real(x_sr_val)).mean()).item()
             G_sr.train(); E_real.train(); flow_real.train()
 
-            if npe_real_val < best_npe_real_val:
-                best_npe_real_val = npe_real_val
-                best_npe_real_val_epoch = abs_epoch
-                best_ckpt_dir = run_dir / "checkpoints" / f"{ts}_best"
-                save_checkpoint(best_ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
+        # ── Calibration checkpoint (real patients, Rap/Ras 90% CI coverage) ─────
+        # Rap/Ras have directly-measured ground truth on real patients (PVR/SVR from
+        # measured pressures+flow), unlike Cas/Eap (model-fit, less reliable) -- so
+        # this measures calibration on the actual target population directly,
+        # unlike npe_real_val (still logged above as a diagnostic, but no longer
+        # drives checkpoint selection -- it's blind to posterior width/overconfidence,
+        # see experiments.csv). Only every --calib-every epochs: 802 patients x
+        # --calib-n-samples flow samples each is much more expensive than npe_real_val.
+        cov_rap = cov_ras = calib_score = float("nan")
+        if phase == "joint" and abs_epoch % args.calib_every == 0:
+            G_sr.eval(); E_real.eval(); flow_real.eval()
+            rap_samples_all, ras_samples_all = [], []
+            with torch.no_grad():
+                for i in range(0, len(real_ds), args.batch_size):
+                    x_chunk = real_ds.x[i:i + args.batch_size].to(device)
+                    if args.freeze_scalars:
+                        waves_sr_c = G_sr(x_chunk[:, :_WAVE_DIM])
+                        x_sr_chunk = torch.cat([waves_sr_c, x_chunk[:, _WAVE_DIM:]], dim=1)
+                    else:
+                        x_sr_chunk = G_sr(x_chunk)
+                    z_chunk = E_real(x_sr_chunk)
+                    for j in range(z_chunk.shape[0]):
+                        s = flow_real.sample((args.calib_n_samples,),
+                                             condition=z_chunk[j:j + 1]).squeeze(1).cpu().numpy()
+                        rap_samples_all.append(s[:, rap_idx])
+                        ras_samples_all.append(s[:, ras_idx])
+            G_sr.train(); E_real.train(); flow_real.train()
+
+            rap_samples_all = np.stack(rap_samples_all)  # (802, calib_n_samples)
+            ras_samples_all = np.stack(ras_samples_all)
+
+            def _coverage90(samples_all, gt_arr, valid):
+                lo = np.percentile(samples_all, 5, axis=1)
+                hi = np.percentile(samples_all, 95, axis=1)
+                return float(((gt_arr[valid] >= lo[valid]) & (gt_arr[valid] <= hi[valid])).mean())
+
+            cov_rap = _coverage90(rap_samples_all, real_gt_rap, rap_valid)
+            cov_ras = _coverage90(ras_samples_all, real_gt_ras, ras_valid)
+            close_rap = 1.0 - abs(cov_rap - 0.90)
+            close_ras = 1.0 - abs(cov_ras - 0.90)
+            calib_score = 2 * close_rap * close_ras / (close_rap + close_ras + 1e-9)
+
+            if calib_score > best_calib_score:
+                best_calib_score = calib_score
+                best_calib_epoch = abs_epoch
+                best_calib_ckpt_dir = run_dir / "checkpoints" / f"{ts}_best_calib"
+                save_checkpoint(best_calib_ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
 
         # ── Epoch logging ─────────────────────────────────────────────────
         nb = max(n_batches, 1)
@@ -804,22 +864,25 @@ def main():
             f"  L_adv={adv_e:.4f}  L_cyc={cyc_e:.4f}  L_id={id_e:.4f}  L_info={info_g_e:.4f}  L_real={real_g_e:.4f}"
             f"  hf_sr={hf_sr_e:.5f}  hf_rs={hf_rs_e:.5f}"
             f"  w1_R={w1_R_e:.4f}  w1_S={w1_S_e:.4f}  gp_R={gp_R_e:.4f}  gp_S={gp_S_e:.4f}"
-            f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}  λ_adv={lam_adv:.3f}  λ_real={lam_real:.3f}")
+            f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}  λ_adv={lam_adv:.3f}  λ_real={lam_real:.3f}"
+            + (f"  cov_rap={cov_rap:.3f}  cov_ras={cov_ras:.3f}  calib_score={calib_score:.3f}"
+               if not np.isnan(calib_score) else ""))
         csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},{gap:.6f},{npe_real:.6f},"
                      f"{npe_real_val:.6f},"
                      f"{adv_e:.6f},{cyc_e:.6f},{id_e:.6f},{info_g_e:.6f},{real_g_e:.6f},"
                      f"{hf_sr_e:.6f},{hf_rs_e:.6f},{G_loss_e:.6f},"
                      f"{w1_R_e:.6f},{w1_S_e:.6f},{gp_R_e:.6f},{gp_S_e:.6f},{critic_loss_e:.6f},"
-                     f"{dw_e:.6f},{ds_e:.6f},{lam_info:.4f},{lam_adv:.4f},{lam_real:.4f}\n")
+                     f"{dw_e:.6f},{ds_e:.6f},{lam_info:.4f},{lam_adv:.4f},{lam_real:.4f},"
+                     f"{cov_rap:.6f},{cov_ras:.6f},{calib_score:.6f}\n")
         csv_fh.flush()
 
     # ── Save checkpoints ──────────────────────────────────────────────────────
     ckpt_dir = run_dir / "checkpoints" / ts
     save_checkpoint(ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
     log(f"Saved checkpoints to {ckpt_dir}")
-    if best_npe_real_val < float("inf"):
-        log(f"Best npe_real_val={best_npe_real_val:.4f} at epoch {best_npe_real_val_epoch} "
-            f"-> {ckpt_dir}_best")
+    if best_calib_score > -float("inf"):
+        log(f"Best calib_score={best_calib_score:.4f} at epoch {best_calib_epoch} "
+            f"-> {ckpt_dir}_best_calib")
 
     # ── run_info (overwrite with full info on completion) ─────────────────────
     with open(run_dir / f"run_info_v{args.version}_{ts}.json", "w") as f:

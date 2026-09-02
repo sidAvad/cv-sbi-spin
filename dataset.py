@@ -149,6 +149,8 @@ class RealBeatsDataset(Dataset):
         n = len(files)
         x_buf  = np.empty((n, obs_dim), dtype=np.float32)
         sv_buf = np.empty((n,),         dtype=np.float32)
+        rap_buf = np.empty((n,),        dtype=np.float32)
+        ras_buf = np.empty((n,),        dtype=np.float32)
 
         for i, fpath in enumerate(files):
             with h5py.File(fpath, "r") as f:
@@ -164,6 +166,8 @@ class RealBeatsDataset(Dataset):
                 sv_z  = float(g["summaries/sv"][()]) / vlv_std
                 hr_z  = (float(g["parameters/HR"][()]) - hr_mean) / hr_std
                 sv_buf[i] = sv_z
+                rap_buf[i] = float(g["parameters/Rap"][()])
+                ras_buf[i] = float(g["parameters/Ras"][()])
 
                 x_buf[i, :N_REDUCED_CHANNELS * T] = waves.ravel()
                 scalars = [map_z, sbp_z, dbp_z, sv_z, hr_z] if include_sv \
@@ -171,9 +175,11 @@ class RealBeatsDataset(Dataset):
                 x_buf[i, N_REDUCED_CHANNELS * T:] = scalars
 
         log(f"  loaded {n} real beats")
-        self.x    = torch.from_numpy(x_buf)
-        self.sv   = torch.from_numpy(sv_buf)
-        self.file = [pathlib.Path(fp).stem for fp in files]
+        self.x       = torch.from_numpy(x_buf)
+        self.sv      = torch.from_numpy(sv_buf)
+        self.gt_rap  = rap_buf  # physical units, directly measured (PVR) -- for calibration checkpointing
+        self.gt_ras  = ras_buf  # physical units, directly measured (SVR) -- for calibration checkpointing
+        self.file    = [pathlib.Path(fp).stem for fp in files]
 
     def __len__(self):
         return len(self.x)
