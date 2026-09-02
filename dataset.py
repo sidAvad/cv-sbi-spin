@@ -166,8 +166,10 @@ class RealBeatsDataset(Dataset):
                 sv_z  = float(g["summaries/sv"][()]) / vlv_std
                 hr_z  = (float(g["parameters/HR"][()]) - hr_mean) / hr_std
                 sv_buf[i] = sv_z
-                rap_buf[i] = float(g["parameters/Rap"][()])
-                ras_buf[i] = float(g["parameters/Ras"][()])
+                # Real patient files name these PVR/SVR, not Rap/Ras (sim data's naming) --
+                # same quantities, different key.
+                rap_buf[i] = float(g["parameters/PVR"][()])
+                ras_buf[i] = float(g["parameters/SVR"][()])
 
                 x_buf[i, :N_REDUCED_CHANNELS * T] = waves.ravel()
                 scalars = [map_z, sbp_z, dbp_z, sv_z, hr_z] if include_sv \
