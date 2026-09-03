@@ -23,21 +23,40 @@ one.
 cyc and id both stay L1 (no adversarial critic for either, for now) at v2c's
 weights. D_R/D_S (WDGRL domain-realism critics) are unchanged from v2c.
 
-New: a high-frequency residual penalty on BOTH generators' own translation
-residual (x_sr - x_s, x_rs - x_r), wave-only portion. Motivation: G_sr's direct
-real-flow anchor only checks whether theta is recoverable from G_sr(x_sim) --
-it can't tell a genuine physiological translation from a generator that smuggles
-an arbitrary, cheaply-decodable watermark into the output. A blanket L1/L2
-penalty on the residual's magnitude would fight legitimate large-scale domain
-shift without particularly suppressing a smuggled code (which only needs a
-few bits, contributes little to total residual magnitude, and would be
-dominated by whatever large-scale shift the residual budget mostly goes to).
-High-frequency content specifically is the cheap, low-visibility channel a
-smuggled code would most plausibly use, so the penalty high-pass filters the
-residual (fixed box-filter low-pass via avg_pool1d, kernel size --hf-kernel)
-and penalizes only the remainder -- legitimate low-frequency/bulk shifts are
-untouched. This is a standing structural guard, not a task-relevant term, so
-its weight (--lam-hf) is constant, not ramped.
+v3/v3b had a high-frequency residual penalty (hf_sr/hf_rs, box-filter high-pass
+via avg_pool1d) as a steganography guard on G_sr's direct anchor -- see
+experiments.csv (v3 row) for the original motivation. v3c removes it entirely
+(the --lam-hf/--hf-kernel mechanism no longer exists) and replaces it with
+smoothness_penalty below, after a linear-probe test (results/cv-sbi-spin/
+across_runs/stego_probe_summary.csv) showed decodable theta signal in G_sr's
+residual concentrated about as much in the low-frequency band as the high --
+hf_sr's fixed high-pass cutoff was fighting the wrong shape of constraint, and
+a checkpoint with collapsed real-patient calibration (exp-v3rerun2_spin ep450)
+showed its residual decoding theta *better* than the raw sim input itself
+(R2=0.22 vs ceiling 0.18), spread across both bands.
+
+v3c: smoothness_penalty (second-order curvature, mean(|delta[t+1] - 2*delta[t]
++ delta[t-1]|)) on G_sr's and G_rs's own residual, wave-only portion. Rationale
+differs from hf_sr's G_sr-only anti-smuggling scope: a code needs many small,
+independent oscillations to pack bits (high curvature by construction), while a
+genuine physiological correction is smooth (low curvature) even at large
+magnitude, so this penalizes wiggliness specifically without fighting legitimate
+bulk shifts the way a magnitude penalty would -- and unlike hf_sr, there's no
+frequency-band cutoff to be wrong about. Applied to BOTH generators (not just
+G_sr) for an independent reason: real physiological waveforms are smooth, so a
+wiggly translation is undesirable either direction regardless of smuggling risk
+-- G_rs's earlier hf_rs exclusion was specifically about it having no anchor to
+smuggle through, which doesn't apply to a general realism constraint. Weight
+--lam-smooth=0.2 is a starting estimate (reasoned from hf_sr's historical
+logged magnitude x weight, scaled up to cover both frequency bands instead of
+just high), not empirically tuned -- watch smooth_sr/smooth_rs and L_id/L_real/
+w1_R in the first epochs of a v3c run and adjust if it's clearly over/under-
+constraining.
+
+v3c also adds a live version of the stego probe (RidgeCV, G_sr's residual on
+held-out val_ds -> theta) logged every --calib-every epochs alongside
+calib_score, so decodability can be watched during training instead of only
+inferred post-hoc from calibration collapse.
 
 Note: this isn't the only steganography guard in the system -- --clamp-info-gap
 (relu(npe_srs - npe_sim), gradient to G only when the round trip is *harder*
@@ -111,7 +130,7 @@ doesn't exist as a meaningful signal before G_sr itself starts training there).
 Per-batch step order (joint phase only):
   1. Critic inner loop   - n_critic updates to D_R, D_S (WGAN-GP; G outputs detached)
   2. Generator step      - update G_sr, G_rs; L_adv + L_cyc + L_id + L_info
-                            + lam_real*L_real_anchor + lam_hf*(hf_sr + hf_rs)
+                            + lam_real*L_real_anchor + lam_smooth*(smooth_sr + smooth_rs)
   3. Sim posterior step  - update E_sim, flow_sim (x_srs detached, no grad into G)
   4. Real posterior step - update E_real, flow_real (G_sr(x_s) detached, no grad into G)
 
@@ -136,6 +155,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
+from sklearn.linear_model import RidgeCV
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
 
 sys.path.insert(0, str(Path(__file__).parent))
 from dataset import (
@@ -145,6 +167,8 @@ from dataset import (
 )
 
 _WAVE_DIM = N_REDUCED_CHANNELS * T  # 804
+_PROBE_KERNEL = 5  # low/high-freq split kernel for the live stego probe, matches
+                   # eval_stego_probe_v3.py's _HF_KERNEL for direct comparability
 from models import (
     LipschitzEncoder, build_flow_net,
     DualBranchGenerator, DualBranchDiscriminator,
@@ -178,26 +202,25 @@ def mixup_real(real_beats: torch.Tensor, n: int, alpha: float, device) -> torch.
     return lam * real_beats[idx_i] + (1 - lam) * real_beats[idx_j]
 
 
-def high_freq_penalty(delta_wave: torch.Tensor, kernel_size: int) -> torch.Tensor:
+def smoothness_penalty(delta_wave: torch.Tensor) -> torch.Tensor:
     """
     delta_wave: (B, N_REDUCED_CHANNELS, T) -- a generator's own residual
     (x_out - x_in), wave portion only.
 
-    Fixed (non-learned) box-filter low-pass via avg_pool1d; penalize only the
-    high-frequency remainder (delta - lowpass(delta)), leaving low-frequency/
-    bulk shifts in delta completely unconstrained. See module docstring for
-    why this targets steganographic smuggling specifically, unlike a blanket
-    magnitude penalty on delta itself.
+    Second-order (curvature) roughness: mean(|delta[t+1] - 2*delta[t] +
+    delta[t-1]|), penalizing local sign-changes in slope (oscillation) rather
+    than magnitude or a fixed frequency-band cutoff. See module docstring for
+    why this targets steganographic smuggling without hf_sr/hf_rs's blind spot
+    (decodable signal found in both frequency bands, not just high), and why
+    it's applied to both generators unlike hf_sr's G_sr-only scope.
     """
-    lowpass = F.avg_pool1d(delta_wave, kernel_size=kernel_size, stride=1,
-                           padding=kernel_size // 2, count_include_pad=False)
-    high_freq = delta_wave - lowpass
-    return high_freq.abs().mean()
+    d2 = delta_wave[:, :, 2:] - 2 * delta_wave[:, :, 1:-1] + delta_wave[:, :, :-2]
+    return d2.abs().mean()
 
 
 def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
-                   x_s, x_r, theta, lam_cyc, lam_id, lam_info, lam_adv, lam_real, lam_hf,
-                   hf_kernel, wave_only=False, clamp_info_gap=False):
+                   x_s, x_r, theta, lam_cyc, lam_id, lam_info, lam_adv, lam_real, lam_smooth,
+                   wave_only=False, clamp_info_gap=False):
     """
     Generator step: update G_sr and G_rs.
 
@@ -214,7 +237,7 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                     E_real anchor (L_real) is unclamped -- see module docstring.
 
     L_G = lam_adv*L_adv + lam_cyc*L_cyc + lam_id*L_id + lam_info*L_info
-        + lam_real*L_real + lam_hf*hf_sr   (hf_rs dropped in v3b, still logged)
+        + lam_real*L_real + lam_smooth*(smooth_sr + smooth_rs)
     """
     def _gen(G, x):
         """Apply generator, routing scalars around it when wave_only."""
@@ -268,19 +291,19 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
     else:
         L_real = torch.zeros(1, device=x_s.device).squeeze()
 
-    # High-frequency residual penalty -- G_sr's own residual only (v3b dropped
-    # hf_rs from the loss, see module docstring; still computed/logged for both).
-    if lam_hf > 0:
+    # Smoothness (curvature) penalty -- both generators, see module docstring for
+    # why this replaces hf_sr/hf_rs and why it applies to G_rs too (unlike hf_rs).
+    if lam_smooth > 0:
         delta_sr_wave = (x_sr - x_s)[:, :_WAVE_DIM].view(-1, N_REDUCED_CHANNELS, T)
         delta_rs_wave = (x_rs - x_r)[:, :_WAVE_DIM].view(-1, N_REDUCED_CHANNELS, T)
-        hf_sr = high_freq_penalty(delta_sr_wave, hf_kernel)
-        hf_rs = high_freq_penalty(delta_rs_wave, hf_kernel)
+        smooth_sr = smoothness_penalty(delta_sr_wave)
+        smooth_rs = smoothness_penalty(delta_rs_wave)
     else:
-        hf_sr = torch.zeros(1, device=x_s.device).squeeze()
-        hf_rs = torch.zeros(1, device=x_s.device).squeeze()
+        smooth_sr = torch.zeros(1, device=x_s.device).squeeze()
+        smooth_rs = torch.zeros(1, device=x_s.device).squeeze()
 
     loss = (lam_adv * L_adv + lam_cyc * L_cyc + lam_id * L_id + lam_info * L_info
-            + lam_real * L_real + lam_hf * hf_sr)
+            + lam_real * L_real + lam_smooth * (smooth_sr + smooth_rs))
 
     with torch.no_grad():
         delta   = (x_sr - x_s).abs()
@@ -288,15 +311,15 @@ def loss_generator(G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
         delta_s = delta[:, _WAVE_DIM:].mean().item()
 
     return loss, {
-        "adv":     L_adv.item(),
-        "cyc":     L_cyc.item(),
-        "id":      L_id.item(),
-        "info":    L_info.item(),
-        "real":    L_real.item(),
-        "hf_sr":   hf_sr.item(),
-        "hf_rs":   hf_rs.item(),
-        "delta_w": delta_w,
-        "delta_s": delta_s,
+        "adv":       L_adv.item(),
+        "cyc":       L_cyc.item(),
+        "id":        L_id.item(),
+        "info":      L_info.item(),
+        "real":      L_real.item(),
+        "smooth_sr": smooth_sr.item(),
+        "smooth_rs": smooth_rs.item(),
+        "delta_w":   delta_w,
+        "delta_s":   delta_s,
     }
 
 
@@ -444,14 +467,13 @@ def main():
     parser.add_argument("--real-ramp",    type=int,   default=50,
                         help="Joint epochs over which lam_real ramps 0→lam_real_max "
                              "(mirrors --info-ramp)")
-    parser.add_argument("--lam-hf",       type=float, default=0.1,
-                        help="Weight on the high-frequency residual penalty (new in v3). "
-                             "Constant, not ramped -- a standing structural guard against "
-                             "steganographic smuggling, not a task-relevant term that "
-                             "should fade in importance over training.")
-    parser.add_argument("--hf-kernel",    type=int,   default=5,
-                        help="Odd kernel size for the box-filter low-pass that defines "
-                             "the high-frequency remainder in the residual penalty")
+    parser.add_argument("--lam-smooth",   type=float, default=0.2,
+                        help="Weight on the smoothness (curvature) penalty (v3c, replaces "
+                             "v3/v3b's hf_sr/hf_rs). Applied to BOTH G_sr and G_rs residuals. "
+                             "Constant, not ramped -- a standing structural guard, not a "
+                             "task-relevant term that should fade in importance over training. "
+                             "0.2 is a starting estimate, not empirically tuned -- see module "
+                             "docstring.")
     parser.add_argument("--freeze-scalars",  action="store_true",
                         help="Wave-only generators/discriminators; scalars bypass G and route directly to encoder")
     parser.add_argument("--no-sv", action="store_true",
@@ -601,7 +623,7 @@ def main():
         f"lam_adv_max={args.lam_adv_max} (ramped over {args.adv_ramp} joint epochs)  "
         f"grad_clip_norm=1.0")
     log(f"E_real anchor: lam_real_max={args.lam_real_max}  real_ramp={args.real_ramp}")
-    log(f"High-freq residual penalty (G_sr only, v3b): lam_hf={args.lam_hf}  hf_kernel={args.hf_kernel}")
+    log(f"Smoothness penalty (both generators, v3c): lam_smooth={args.lam_smooth}")
     log(f"Mixup (v3b): use_mixup={args.use_mixup}  mixup_alpha={args.mixup_alpha}")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
@@ -631,8 +653,9 @@ def main():
         csv_path = run_dir / f"train_log_{ts}.csv"
         csv_fh   = open(csv_path, "w")
         csv_fh.write("epoch,phase,npe_sim,npe_srs,gap,npe_real,npe_real_val,L_adv,L_cyc,L_id,L_info_G,L_real_G,"
-                     "hf_sr,hf_rs,loss_G,w1_R,w1_S,gp_R,gp_S,loss_critic,delta_waves,delta_scal,"
-                     "lam_info,lam_adv,lam_real,cov_rap,cov_ras,calib_score\n")
+                     "smooth_sr,smooth_rs,loss_G,w1_R,w1_S,gp_R,gp_S,loss_critic,delta_waves,delta_scal,"
+                     "lam_info,lam_adv,lam_real,cov_rap,cov_ras,calib_score,"
+                     "probe_r2_full,probe_r2_low,probe_r2_high\n")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     end_epoch = args.start_epoch + args.max_epochs - 1
@@ -663,7 +686,7 @@ def main():
         for p in D_S.parameters():       p.requires_grad = (phase == "joint")
 
         enc_npe_sum = G_loss_sum = critic_loss_sum = npe_srs_sum = npe_real_sum = 0.0
-        adv_sum = cyc_sum = id_sum = info_g_sum = real_g_sum = hf_sr_sum = hf_rs_sum = 0.0
+        adv_sum = cyc_sum = id_sum = info_g_sum = real_g_sum = smooth_sr_sum = smooth_rs_sum = 0.0
         w1_R_sum = w1_S_sum = gp_R_sum = gp_S_sum = dw_sum = ds_sum = 0.0
         n_batches = 0
 
@@ -713,7 +736,7 @@ def main():
                 G_loss, G_info = loss_generator(
                     G_sr, G_rs, D_R, D_S, E_sim, flow_sim, E_real, flow_real,
                     x_s, x_r, theta, args.lam_cyc, args.lam_id, lam_info_G, lam_adv,
-                    lam_real, args.lam_hf, args.hf_kernel,
+                    lam_real, args.lam_smooth,
                     wave_only=args.freeze_scalars,
                     clamp_info_gap=args.clamp_info_gap,
                 )
@@ -732,8 +755,8 @@ def main():
                 id_sum      += G_info["id"]
                 info_g_sum  += G_info["info"]
                 real_g_sum  += G_info["real"]
-                hf_sr_sum   += G_info["hf_sr"]
-                hf_rs_sum   += G_info["hf_rs"]
+                smooth_sr_sum += G_info["smooth_sr"]
+                smooth_rs_sum += G_info["smooth_rs"]
                 dw_sum      += G_info["delta_w"]
                 ds_sum      += G_info["delta_s"]
 
@@ -850,6 +873,46 @@ def main():
                 save_checkpoint(thresh_ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
                 log(f"  calib_score={calib_score:.4f} > {args.calib_threshold} -> saved {thresh_ckpt_dir}")
 
+        # ── Live steganography probe (RidgeCV on G_sr's residual -> theta) ──────
+        # Same cadence as the calibration check above, on the same held-out val_ds
+        # (fixed random_state for the probe's own train/test split, so the R2
+        # trajectory across epochs isn't confounded by the split itself changing
+        # epoch to epoch). Live version of eval_stego_probe_v3.py's post-hoc probe
+        # -- see experiments.csv (v3 reruns row) for what the post-hoc numbers
+        # found (decodable theta signal in G_sr's residual, worse in collapsed
+        # checkpoints) and why this exists: watching it during training instead of
+        # only inferring it after the fact from calibration collapse.
+        probe_r2_full = probe_r2_low = probe_r2_high = float("nan")
+        if val_ds is not None and phase == "joint" and abs_epoch % args.calib_every == 0:
+            G_sr.eval()
+            with torch.no_grad():
+                x_val_all = val_ds.x.to(device)
+                if args.freeze_scalars:
+                    waves_sr_all = G_sr(x_val_all[:, :_WAVE_DIM])
+                    x_sr_all = torch.cat([waves_sr_all, x_val_all[:, _WAVE_DIM:]], dim=1)
+                else:
+                    x_sr_all = G_sr(x_val_all)
+                delta_val = (x_sr_all - x_val_all)[:, :_WAVE_DIM].view(-1, N_REDUCED_CHANNELS, T)
+                low_val = F.avg_pool1d(delta_val, kernel_size=_PROBE_KERNEL, stride=1,
+                                       padding=_PROBE_KERNEL // 2, count_include_pad=False)
+                high_val = delta_val - low_val
+            G_sr.train()
+
+            theta_np = val_ds.theta.numpy()
+            full_np = delta_val.cpu().numpy().reshape(len(theta_np), -1)
+            low_np  = low_val.cpu().numpy().reshape(len(theta_np), -1)
+            high_np = high_val.cpu().numpy().reshape(len(theta_np), -1)
+
+            def _probe_r2(X):
+                X_tr, X_te, y_tr, y_te = train_test_split(X, theta_np, test_size=0.25, random_state=0)
+                model = RidgeCV(alphas=np.logspace(-2, 4, 13))
+                model.fit(X_tr, y_tr)
+                return float(r2_score(y_te, model.predict(X_te), multioutput='uniform_average'))
+
+            probe_r2_full = _probe_r2(full_np)
+            probe_r2_low  = _probe_r2(low_np)
+            probe_r2_high = _probe_r2(high_np)
+
         # ── Epoch logging ─────────────────────────────────────────────────
         nb = max(n_batches, 1)
         npe_sim  = enc_npe_sum / n_batches
@@ -863,8 +926,8 @@ def main():
         id_e     = id_sum      / nb
         info_g_e = info_g_sum  / nb
         real_g_e = real_g_sum  / nb
-        hf_sr_e  = hf_sr_sum   / nb
-        hf_rs_e  = hf_rs_sum   / nb
+        smooth_sr_e = smooth_sr_sum / nb
+        smooth_rs_e = smooth_rs_sum / nb
         w1_R_e   = w1_R_sum    / nb
         w1_S_e   = w1_S_sum    / nb
         gp_R_e   = gp_R_sum    / nb
@@ -876,18 +939,22 @@ def main():
             f"  npe_sim={npe_sim:.4f}  npe_srs={npe_srs:.4f}  gap={gap:+.4f}  npe_real={npe_real:.4f}"
             f"  npe_real_val={npe_real_val:.4f}"
             f"  L_adv={adv_e:.4f}  L_cyc={cyc_e:.4f}  L_id={id_e:.4f}  L_info={info_g_e:.4f}  L_real={real_g_e:.4f}"
-            f"  hf_sr={hf_sr_e:.5f}  hf_rs={hf_rs_e:.5f}"
+            f"  smooth_sr={smooth_sr_e:.5f}  smooth_rs={smooth_rs_e:.5f}"
             f"  w1_R={w1_R_e:.4f}  w1_S={w1_S_e:.4f}  gp_R={gp_R_e:.4f}  gp_S={gp_S_e:.4f}"
             f"  |Δ|_w={dw_e:.4f}  |Δ|_s={ds_e:.4f}  λ_info={lam_info:.3f}  λ_adv={lam_adv:.3f}  λ_real={lam_real:.3f}"
             + (f"  cov_rap={cov_rap:.3f}  cov_ras={cov_ras:.3f}  calib_score={calib_score:.3f}"
-               if not np.isnan(calib_score) else ""))
+               if not np.isnan(calib_score) else "")
+            + (f"  probe_r2_full={probe_r2_full:.3f}  probe_r2_low={probe_r2_low:.3f}  "
+               f"probe_r2_high={probe_r2_high:.3f}"
+               if not np.isnan(probe_r2_full) else ""))
         csv_fh.write(f"{abs_epoch},{phase},{npe_sim:.6f},{npe_srs:.6f},{gap:.6f},{npe_real:.6f},"
                      f"{npe_real_val:.6f},"
                      f"{adv_e:.6f},{cyc_e:.6f},{id_e:.6f},{info_g_e:.6f},{real_g_e:.6f},"
-                     f"{hf_sr_e:.6f},{hf_rs_e:.6f},{G_loss_e:.6f},"
+                     f"{smooth_sr_e:.6f},{smooth_rs_e:.6f},{G_loss_e:.6f},"
                      f"{w1_R_e:.6f},{w1_S_e:.6f},{gp_R_e:.6f},{gp_S_e:.6f},{critic_loss_e:.6f},"
                      f"{dw_e:.6f},{ds_e:.6f},{lam_info:.4f},{lam_adv:.4f},{lam_real:.4f},"
-                     f"{cov_rap:.6f},{cov_ras:.6f},{calib_score:.6f}\n")
+                     f"{cov_rap:.6f},{cov_ras:.6f},{calib_score:.6f},"
+                     f"{probe_r2_full:.6f},{probe_r2_low:.6f},{probe_r2_high:.6f}\n")
         csv_fh.flush()
 
     # ── Save checkpoints ──────────────────────────────────────────────────────
@@ -918,8 +985,8 @@ def main():
                 "lam_cyc": args.lam_cyc, "lam_id": args.lam_id,
                 "lam_info_max": args.lam_info_max,
                 "lam_real_max": args.lam_real_max,
-                "lam_hf": args.lam_hf, "hf_kernel": args.hf_kernel,
-                "hf_applies_to": "G_sr only (v3b)",
+                "lam_smooth": args.lam_smooth,
+                "smooth_applies_to": "both G_sr and G_rs (v3c)",
             },
             "flags": {
                 "freeze_scalars": args.freeze_scalars,
