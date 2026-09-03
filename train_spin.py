@@ -419,6 +419,17 @@ def main():
                              "--calib-n-samples flow samples each), hence not every epoch.")
     parser.add_argument("--calib-n-samples", type=int, default=300,
                         help="Posterior samples per real patient for the calibration checkpoint metric")
+    parser.add_argument("--calib-threshold", type=float, default=0.7,
+                        help="Save a checkpoint (accumulating, tagged by epoch -- NOT overwritten "
+                             "in place, unlike the old single running-best pattern) every time "
+                             "calib_score exceeds this. Rationale: calib_score alone rewards being "
+                             "appropriately uncertain, not being accurate (an early, unconverged "
+                             "checkpoint can score very well on coverage while its point estimates "
+                             "are still poor -- confirmed on exp-v3rerun3_spin's ep50 checkpoint, "
+                             "R2 collapsed even though calib_score=0.88 was its run's peak). "
+                             "Checkpointing every high-calibration epoch instead of just the single "
+                             "best lets a post-hoc scan pick whichever also has good npe_real, "
+                             "rather than trusting calib_score's argmax blindly.")
     parser.add_argument("--max-epochs",   type=int, default=400)
     parser.add_argument("--flow-warmup",  type=int, default=2)
     parser.add_argument("--enc-warmup",   type=int, default=10)
@@ -833,8 +844,11 @@ def main():
             if calib_score > best_calib_score:
                 best_calib_score = calib_score
                 best_calib_epoch = abs_epoch
-                best_calib_ckpt_dir = run_dir / "checkpoints" / f"{ts}_best_calib"
-                save_checkpoint(best_calib_ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
+
+            if calib_score > args.calib_threshold:
+                thresh_ckpt_dir = run_dir / "checkpoints" / f"{ts}_calib_ep{abs_epoch}"
+                save_checkpoint(thresh_ckpt_dir, E_sim, flow_sim, E_real, flow_real, G_sr, G_rs, D_R, D_S)
+                log(f"  calib_score={calib_score:.4f} > {args.calib_threshold} -> saved {thresh_ckpt_dir}")
 
         # ── Epoch logging ─────────────────────────────────────────────────
         nb = max(n_batches, 1)
@@ -882,7 +896,8 @@ def main():
     log(f"Saved checkpoints to {ckpt_dir}")
     if best_calib_score > -float("inf"):
         log(f"Best calib_score={best_calib_score:.4f} at epoch {best_calib_epoch} "
-            f"-> {ckpt_dir}_best_calib")
+            f"(threshold checkpoints saved at every epoch where calib_score > "
+            f"{args.calib_threshold}, see checkpoints/{ts}_calib_ep*)")
 
     # ── run_info (overwrite with full info on completion) ─────────────────────
     with open(run_dir / f"run_info_v{args.version}_{ts}.json", "w") as f:
