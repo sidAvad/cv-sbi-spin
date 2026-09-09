@@ -370,7 +370,7 @@ def loss_sim_posterior(E_sim, flow_sim, x_s, theta, x_srs_detached, lam_info):
     return loss, {"npe_sim": npe_sim.item(), "npe_srs": npe_srs.item()}
 
 
-def loss_real_posterior(E_real, flow_real, x_sr_detached, theta):
+def loss_real_posterior(E_real, flow_real, x_sr_detached, theta, z_noise_sigma=0.0):
     """
     Real posterior step: update E_real and flow_real.
     x_sr_detached (= G_sr(x_s), detached) must already be detached -- no grad
@@ -378,9 +378,30 @@ def loss_real_posterior(E_real, flow_real, x_sr_detached, theta):
     is an exact pair, no matching/pseudo-labeling needed (unlike the JDOT line's
     real patient data, which has no known sim correspondence at all).
 
-    L = -log flow_real(theta | E_real(x_sr_detached))
+    z_noise_sigma (v3e): isotropic Gaussian noise added to E_real's output before
+    it conditions flow_real, targeting a specific failure mode diagnosed across
+    v3/v3b/v3rerun2/v3rerun3/v3c (see experiments.csv): flow_real's posterior
+    sharpens as npe_real improves with training, and even a small, roughly-constant
+    gap between E_real(G_sr(sim)) (what flow_real trains on) and E_real(G_sr(real))
+    (what it's evaluated on at inference) becomes increasingly punishing as the
+    flow's tolerance around each training point shrinks -- the gap itself doesn't
+    need to grow for calibration to collapse, confirmed via a direct MMD2 probe
+    across checkpoints (results/cv-sbi-spin/across_runs/latent_gap_summary.csv)
+    that ran opposite a naive "bigger gap causes worse calibration" story. Training
+    flow_real to stay accurate under small perturbations of its own conditioning
+    vector directly counters this: it can no longer collapse into an arbitrarily
+    narrow peak around exact training points. sigma is data-grounded, not guessed --
+    measured directly as the isotropic-equivalent per-dimension gap between
+    E_real(G_sr(held-out sims)) and E_real(G_sr(802 real patients)) on the
+    checkpoint this change is built on top of (exp-v3d_spin ep380: centroid
+    distance 1.031 over 128 dims -> 0.091 per-dim).
+
+    L = -log flow_real(theta | E_real(x_sr_detached) + noise)
     """
-    npe_real = -flow_real.log_prob(theta, condition=E_real(x_sr_detached)).mean()
+    z = E_real(x_sr_detached)
+    if z_noise_sigma > 0:
+        z = z + torch.randn_like(z) * z_noise_sigma
+    npe_real = -flow_real.log_prob(theta, condition=z).mean()
     return npe_real, {"npe_real": npe_real.item()}
 
 
@@ -474,6 +495,15 @@ def main():
                              "task-relevant term that should fade in importance over training. "
                              "0.2 is a starting estimate, not empirically tuned -- see module "
                              "docstring.")
+    parser.add_argument("--z-noise-sigma", type=float, default=0.0,
+                        help="v3e: isotropic Gaussian noise added to E_real's output before it "
+                             "conditions flow_real during the real posterior step. Counters flow "
+                             "overconfidence by preventing the posterior from collapsing into an "
+                             "arbitrarily narrow peak around exact training points -- see "
+                             "loss_real_posterior's docstring. Data-grounded starting value: 0.09, "
+                             "measured as the isotropic per-dim E_real(G_sr(sim)) vs "
+                             "E_real(G_sr(real)) gap on exp-v3d_spin's ep380 checkpoint. Default 0 "
+                             "(off) for backward compatibility with pre-v3e runs.")
     parser.add_argument("--freeze-scalars",  action="store_true",
                         help="Wave-only generators/discriminators; scalars bypass G and route directly to encoder")
     parser.add_argument("--no-sv", action="store_true",
@@ -624,6 +654,7 @@ def main():
         f"grad_clip_norm=1.0")
     log(f"E_real anchor: lam_real_max={args.lam_real_max}  real_ramp={args.real_ramp}")
     log(f"Smoothness penalty (both generators, v3c): lam_smooth={args.lam_smooth}")
+    log(f"Latent conditioning noise (v3e): z_noise_sigma={args.z_noise_sigma}")
     log(f"Mixup (v3b): use_mixup={args.use_mixup}  mixup_alpha={args.mixup_alpha}")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
@@ -793,7 +824,8 @@ def main():
                     else:
                         x_sr_detached = G_sr(x_s)
 
-                real_loss, real_info = loss_real_posterior(E_real, flow_real, x_sr_detached, theta)
+                real_loss, real_info = loss_real_posterior(E_real, flow_real, x_sr_detached, theta,
+                                                           z_noise_sigma=args.z_noise_sigma)
                 real_loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(E_real.parameters()) + list(flow_real.parameters()), 1.0)
                 opt_real.step()
@@ -987,6 +1019,7 @@ def main():
                 "lam_real_max": args.lam_real_max,
                 "lam_smooth": args.lam_smooth,
                 "smooth_applies_to": "both G_sr and G_rs (v3c)",
+                "z_noise_sigma": args.z_noise_sigma,
             },
             "flags": {
                 "freeze_scalars": args.freeze_scalars,
