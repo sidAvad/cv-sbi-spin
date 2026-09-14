@@ -495,6 +495,17 @@ def main():
                              "task-relevant term that should fade in importance over training. "
                              "0.2 is a starting estimate, not empirically tuned -- see module "
                              "docstring.")
+    parser.add_argument("--flow-dropout", type=float, default=0.0,
+                        help="v3f: dropout_probability inside flow_real's MADE/conditioner "
+                             "blocks (nflows' build_maf, forwarded via sbi's posterior_nn). "
+                             "Applied ONLY to flow_real, not flow_sim -- flow_sim isn't "
+                             "diagnosed with the overconfidence problem this targets "
+                             "(npe_real_val tracks npe_sim closely with no train/val gap, see "
+                             "experiments.csv). Standard training-time regularization, not "
+                             "MC-dropout -- doesn't itself widen the reported posterior at "
+                             "inference (dropout is off for the deterministic eval-time pass), "
+                             "it's a bet that a more robustly-trained conditioner generalizes "
+                             "better to real patients' z's. Default 0.0 (off).")
     parser.add_argument("--z-noise-sigma", type=float, default=0.0,
                         help="v3e: isotropic Gaussian noise added to E_real's output before it "
                              "conditions flow_real during the real posterior step. Counters flow "
@@ -619,7 +630,8 @@ def main():
     E_sim     = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
     flow_sim  = build_flow_net(args.latent_dim, theta_all).to(device)
     E_real    = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
-    flow_real = build_flow_net(args.latent_dim, theta_all).to(device)
+    flow_real = build_flow_net(args.latent_dim, theta_all,
+                               dropout_probability=args.flow_dropout).to(device)
     G_sr    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
     G_rs    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
     D_R     = DualBranchDiscriminator(wave_only=args.freeze_scalars).to(device)
@@ -655,6 +667,7 @@ def main():
     log(f"E_real anchor: lam_real_max={args.lam_real_max}  real_ramp={args.real_ramp}")
     log(f"Smoothness penalty (both generators, v3c): lam_smooth={args.lam_smooth}")
     log(f"Latent conditioning noise (v3e): z_noise_sigma={args.z_noise_sigma}")
+    log(f"Flow conditioner dropout (v3f, flow_real only): flow_dropout={args.flow_dropout}")
     log(f"Mixup (v3b): use_mixup={args.use_mixup}  mixup_alpha={args.mixup_alpha}")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
@@ -1020,6 +1033,7 @@ def main():
                 "lam_smooth": args.lam_smooth,
                 "smooth_applies_to": "both G_sr and G_rs (v3c)",
                 "z_noise_sigma": args.z_noise_sigma,
+                "flow_dropout": args.flow_dropout,
             },
             "flags": {
                 "freeze_scalars": args.freeze_scalars,

@@ -125,8 +125,23 @@ class LipschitzEncoder(nn.Module):
 # ── Flow q_ψ ─────────────────────────────────────────────────────────────────
 
 def build_flow_net(latent_dim: int, theta_stats: torch.Tensor,
-                   hidden_features: int = 128, num_transforms: int = 5) -> nn.Module:
-    """MAF5 flow via sbi's posterior_nn with identity embedding."""
+                   hidden_features: int = 128, num_transforms: int = 5,
+                   dropout_probability: float = 0.0) -> nn.Module:
+    """
+    MAF5 flow via sbi's posterior_nn with identity embedding.
+
+    dropout_probability (v3f): forwarded to nflows' build_maf, applied inside the
+    MAF's own MADE/conditioner blocks -- the network that maps the conditioning
+    vector z into the flow's transform parameters at each layer. More directly
+    targeted than upstream (E_real-side) regularization at preventing the flow's
+    posterior from sharpening into an arbitrarily narrow peak around exact training
+    z's, since it regularizes the exact computation that shapes posterior width
+    from z. Standard training-time regularization (dropout active during training,
+    off for the single deterministic pass at inference) -- not MC-dropout; doesn't
+    itself widen the reported posterior at inference the way --z-noise-sigma does,
+    it's a bet that a more robustly-trained conditioner generalizes better to real
+    patients' z's. Default 0.0 (off) for backward compatibility with pre-v3f runs.
+    """
     build_fn = posterior_nn(
         model="maf",
         embedding_net=nn.Identity(),
@@ -134,6 +149,7 @@ def build_flow_net(latent_dim: int, theta_stats: torch.Tensor,
         num_transforms=num_transforms,
         z_score_theta="independent",
         z_score_x="none",
+        dropout_probability=dropout_probability,
     )
     z_dummy = torch.zeros(len(theta_stats), latent_dim)
     return build_fn(theta_stats.cpu(), z_dummy)
