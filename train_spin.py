@@ -506,6 +506,13 @@ def main():
                              "inference (dropout is off for the deterministic eval-time pass), "
                              "it's a bet that a more robustly-trained conditioner generalizes "
                              "better to real patients' z's. Default 0.0 (off).")
+    parser.add_argument("--drop-finest-skip", action="store_true",
+                        help="v3h: drop the enc1->mix1 skip connection in both G_sr and G_rs "
+                             "(DualBranchGenerator). enc1 is at full input resolution -- zero "
+                             "bottleneck compression -- the highest-bandwidth pass-through in "
+                             "the UNet and most plausible channel for near-identity fine-detail "
+                             "leakage/smuggling. Complements --lam-smooth rather than replacing "
+                             "it -- see models.py's DualBranchGenerator docstring.")
     parser.add_argument("--z-noise-sigma", type=float, default=0.0,
                         help="v3e: isotropic Gaussian noise added to E_real's output before it "
                              "conditions flow_real during the real posterior step. Counters flow "
@@ -632,8 +639,10 @@ def main():
     E_real    = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
     flow_real = build_flow_net(args.latent_dim, theta_all,
                                dropout_probability=args.flow_dropout).to(device)
-    G_sr    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
-    G_rs    = DualBranchGenerator(wave_only=args.freeze_scalars).to(device)
+    G_sr    = DualBranchGenerator(wave_only=args.freeze_scalars,
+                                  drop_finest_skip=args.drop_finest_skip).to(device)
+    G_rs    = DualBranchGenerator(wave_only=args.freeze_scalars,
+                                  drop_finest_skip=args.drop_finest_skip).to(device)
     D_R     = DualBranchDiscriminator(wave_only=args.freeze_scalars).to(device)
     D_S     = DualBranchDiscriminator(wave_only=args.freeze_scalars).to(device)
 
@@ -668,6 +677,7 @@ def main():
     log(f"Smoothness penalty (both generators, v3c): lam_smooth={args.lam_smooth}")
     log(f"Latent conditioning noise (v3e): z_noise_sigma={args.z_noise_sigma}")
     log(f"Flow conditioner dropout (v3f, flow_real only): flow_dropout={args.flow_dropout}")
+    log(f"Drop finest UNet skip (v3h, both generators): drop_finest_skip={args.drop_finest_skip}")
     log(f"Mixup (v3b): use_mixup={args.use_mixup}  mixup_alpha={args.mixup_alpha}")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
@@ -1034,6 +1044,7 @@ def main():
                 "smooth_applies_to": "both G_sr and G_rs (v3c)",
                 "z_noise_sigma": args.z_noise_sigma,
                 "flow_dropout": args.flow_dropout,
+                "drop_finest_skip": args.drop_finest_skip,
             },
             "flags": {
                 "freeze_scalars": args.freeze_scalars,

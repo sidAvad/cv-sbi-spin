@@ -182,10 +182,25 @@ class DualBranchGenerator(nn.Module):
     """
 
     def __init__(self, wave_ch: int = 32, scalar_hidden: int = 32,
-                 bottleneck_ch: int = 256, wave_only: bool = False):
+                 bottleneck_ch: int = 256, wave_only: bool = False,
+                 drop_finest_skip: bool = False):
         super().__init__()
         self.wave_len  = N_REDUCED_CHANNELS * T  # 804
         self.wave_only = wave_only
+        # v3h: drop the enc1->mix1 skip. enc1 is at FULL input resolution (no
+        # downsampling) -- zero bottleneck compression between input and the final
+        # decoder stage, the highest-bandwidth pass-through in this UNet and the
+        # most plausible channel for near-identity fine-detail leakage/smuggling
+        # (a known failure mode in CycleGAN-style architectures, specifically
+        # attributed to finest-resolution skips). enc1 still runs (h1 feeds enc2's
+        # downsampling path) -- only the skip *connection* into mix1 is removed.
+        # Complements --lam-smooth rather than replacing it: the smoothness
+        # penalty constrains the residual regardless of which pathway produced it,
+        # while this only closes the finest-resolution route -- enc2/enc3's skips
+        # (100/50 timesteps, not full resolution) remain. Applied to both G_sr and
+        # G_rs (same class) -- general capacity reduction, not an anti-smuggling-
+        # specific asymmetry like --lam-hf's old G_sr-only scope.
+        self.drop_finest_skip = drop_finest_skip
 
         # Waveform encoder
         self.enc1 = nn.Sequential(
@@ -220,7 +235,8 @@ class DualBranchGenerator(nn.Module):
         self.mix2 = nn.Sequential(nn.Conv1d(wave_ch*2*2, wave_ch*2, 3, padding=1), nn.SiLU())
 
         self.up1  = nn.ConvTranspose1d(wave_ch*2, wave_ch, 4, stride=2, padding=1, output_padding=1)
-        self.mix1 = nn.Sequential(nn.Conv1d(wave_ch*2, wave_ch, 3, padding=1), nn.SiLU())
+        mix1_in_ch = wave_ch if drop_finest_skip else wave_ch * 2
+        self.mix1 = nn.Sequential(nn.Conv1d(mix1_in_ch, wave_ch, 3, padding=1), nn.SiLU())
 
         # Output heads — zero-init so generator starts as identity
         self.wave_head = nn.Conv1d(wave_ch, N_REDUCED_CHANNELS, 1)
@@ -253,7 +269,10 @@ class DualBranchGenerator(nn.Module):
         # Decode: upsample → cat skip → mix
         h = self.mix3(torch.cat([F.silu(self.up3(h)), h3], dim=1))   # (B, 128, 50)
         h = self.mix2(torch.cat([F.silu(self.up2(h)), h2], dim=1))   # (B,  64, 100)
-        h = self.mix1(torch.cat([F.silu(self.up1(h)), h1], dim=1))   # (B,  32, 201)
+        if self.drop_finest_skip:
+            h = self.mix1(F.silu(self.up1(h)))                        # (B,  32, 201)  -- no h1 skip
+        else:
+            h = self.mix1(torch.cat([F.silu(self.up1(h)), h1], dim=1))   # (B,  32, 201)
 
         delta_waves = self.wave_head(h)                                # (B, 4, 201)
         out_waves   = waves + delta_waves                              # (B, 4, 201)
