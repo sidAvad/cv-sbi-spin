@@ -154,7 +154,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, Subset
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
@@ -474,6 +474,22 @@ def main():
                              "Checkpointing every high-calibration epoch instead of just the single "
                              "best lets a post-hoc scan pick whichever also has good npe_real, "
                              "rather than trusting calib_score's argmax blindly.")
+    parser.add_argument("--real-held-out-frac", type=float, default=0.0,
+                        help="v3d-split: fraction of the 802 real patients held out ENTIRELY -- "
+                             "never touched during training in any form (not just excluded from "
+                             "calib_score's ground truth, excluded from D_R/D_S critic sampling, "
+                             "L_id, L_cyc, and mixup too). Addresses a real gap: every real patient "
+                             "is already 'seen' unsupervised during training even though Rap/Ras "
+                             "ground truth is never a training target, so calib_score (computed on "
+                             "all 802) could soft-leak through that channel the way npe_real_val's "
+                             "genuinely untouched held-out sims never could. calib_score/checkpoint "
+                             "selection now computed ONLY on the train subset; the held-out subset's "
+                             "patient filenames are written to run_info.json so eval scripts can "
+                             "later score checkpoints on a population the model never touched at "
+                             "all. Default 0.0 (off) for backward compatibility -- all runs through "
+                             "v3h used the full 802.")
+    parser.add_argument("--real-held-out-seed", type=int, default=42,
+                        help="Seed for the train/held-out real-patient split (--real-held-out-frac).")
     parser.add_argument("--max-epochs",   type=int, default=400)
     parser.add_argument("--flow-warmup",  type=int, default=2)
     parser.add_argument("--enc-warmup",   type=int, default=10)
@@ -609,14 +625,33 @@ def main():
 
     log(f"Loading real patient beats from {args.real_data}...")
     real_ds = RealBeatsDataset(args.real_data, stats, log=log, include_sv=include_sv)
-    real_sampler = RandomSampler(real_ds, replacement=True, num_samples=len(sim_ds))
-    real_dl = DataLoader(real_ds, batch_size=args.batch_size, sampler=real_sampler,
+
+    n_real = len(real_ds)
+    if args.real_held_out_frac > 0:
+        rng = np.random.RandomState(args.real_held_out_seed)
+        perm = rng.permutation(n_real)
+        n_heldout = int(round(n_real * args.real_held_out_frac))
+        heldout_idx = np.sort(perm[:n_heldout])
+        train_idx   = np.sort(perm[n_heldout:])
+        heldout_files = [real_ds.file[i] for i in heldout_idx]
+        log(f"Real patients: {len(train_idx)} train / {len(heldout_idx)} held-out "
+            f"(frac={args.real_held_out_frac}, seed={args.real_held_out_seed}) -- "
+            f"held-out patients never touched during training in any form")
+    else:
+        train_idx = np.arange(n_real)
+        heldout_files = []
+
+    real_ds_train = Subset(real_ds, train_idx.tolist())
+    real_sampler = RandomSampler(real_ds_train, replacement=True, num_samples=len(sim_ds))
+    real_dl = DataLoader(real_ds_train, batch_size=args.batch_size, sampler=real_sampler,
                          num_workers=0, pin_memory=True, drop_last=True)
 
     rap_idx = PARAM_KEYS_INFER.index("Rap")
     ras_idx = PARAM_KEYS_INFER.index("Ras")
-    real_gt_rap = real_ds.gt_rap  # (802,) physical units, directly measured (PVR)
-    real_gt_ras = real_ds.gt_ras  # (802,) physical units, directly measured (SVR)
+    # Restricted to the train subset -- calib_score/checkpoint selection must never
+    # see held-out patients, same rationale as the held-out split itself.
+    real_gt_rap = real_ds.gt_rap[train_idx]  # physical units, directly measured (PVR)
+    real_gt_ras = real_ds.gt_ras[train_idx]  # physical units, directly measured (SVR)
     rap_valid = ~np.isnan(real_gt_rap) & (real_gt_rap >= 0)
     ras_valid = ~np.isnan(real_gt_ras) & (real_gt_ras >= 0)
 
@@ -627,8 +662,10 @@ def main():
             f"never trained on)...")
         val_ds = ReducedCVDataset(str(sim_root / "test"), manifest_test["index"][:args.n_val_sims],
                                   stats, log=log, include_sv=include_sv)
-    log(f"Real beats: {len(real_ds)}  (oversampled to ~{len(sim_ds)} per epoch)")
-    real_beats_gpu = real_ds.x.to(device)  # small (802, 808 or 809); kept resident for mixup_real
+    log(f"Real beats: {len(train_idx)} train (of {len(real_ds)} total)  "
+        f"(oversampled to ~{len(sim_ds)} per epoch)")
+    real_train_x = real_ds.x[train_idx]
+    real_beats_gpu = real_train_x.to(device)  # small; kept resident for mixup_real -- train subset only
 
     log("Collecting theta stats for flow...")
     theta_all = sim_ds.theta[:min(10_000, len(sim_ds))]
@@ -749,8 +786,8 @@ def main():
         def sample_real(n):
             if args.use_mixup:
                 return mixup_real(real_beats_gpu, n, args.mixup_alpha, device)
-            idx = torch.randint(0, len(real_ds), (n,))
-            return real_ds.x[idx].to(device)
+            idx = torch.randint(0, len(real_train_x), (n,))
+            return real_train_x[idx].to(device)
 
         for theta, x_s in sim_dl:
             theta = theta.to(device)
@@ -883,15 +920,20 @@ def main():
         # this measures calibration on the actual target population directly,
         # unlike npe_real_val (still logged above as a diagnostic, but no longer
         # drives checkpoint selection -- it's blind to posterior width/overconfidence,
-        # see experiments.csv). Only every --calib-every epochs: 802 patients x
-        # --calib-n-samples flow samples each is much more expensive than npe_real_val.
+        # see experiments.csv). Computed on the TRAIN subset only (real_train_x) when
+        # --real-held-out-frac > 0 -- otherwise every real patient's waveform is
+        # already used unsupervised in D_R/D_S/L_id/L_cyc, so calib_score computed
+        # over all patients could soft-leak through that channel the way
+        # npe_real_val's genuinely untouched held-out sims never could. Only every
+        # --calib-every epochs: len(real_train_x) patients x --calib-n-samples flow
+        # samples each is much more expensive than npe_real_val.
         cov_rap = cov_ras = calib_score = float("nan")
         if phase == "joint" and abs_epoch % args.calib_every == 0:
             G_sr.eval(); E_real.eval(); flow_real.eval()
             rap_samples_all, ras_samples_all = [], []
             with torch.no_grad():
-                for i in range(0, len(real_ds), args.batch_size):
-                    x_chunk = real_ds.x[i:i + args.batch_size].to(device)
+                for i in range(0, len(real_train_x), args.batch_size):
+                    x_chunk = real_train_x[i:i + args.batch_size].to(device)
                     if args.freeze_scalars:
                         waves_sr_c = G_sr(x_chunk[:, :_WAVE_DIM])
                         x_sr_chunk = torch.cat([waves_sr_c, x_chunk[:, _WAVE_DIM:]], dim=1)
@@ -1063,7 +1105,11 @@ def main():
                 "grad_clip_norm": "1.0, decoupled per-generator for G_sr/G_rs (v3b)",
             },
             "data": {
-                "n_sims": args.n_sims, "n_val_sims": args.n_val_sims, "n_real_beats": len(real_ds),
+                "n_sims": args.n_sims, "n_val_sims": args.n_val_sims,
+                "n_real_beats": len(real_ds), "n_real_beats_train": len(train_idx),
+                "real_held_out_frac": args.real_held_out_frac,
+                "real_held_out_seed": args.real_held_out_seed,
+                "real_held_out_files": heldout_files,
                 "sim_data_root": args.sim_data_root, "real_data": args.real_data,
             },
         }, f, indent=2)
