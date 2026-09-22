@@ -155,6 +155,84 @@ def build_flow_net(latent_dim: int, theta_stats: torch.Tensor,
     return build_fn(theta_stats.cpu(), z_dummy)
 
 
+class MLPPosteriorHead(nn.Module):
+    """
+    v4: point-prediction replacement for build_flow_net's MAF, used to test how
+    much of SPIN's real-patient calibration comes from the flow's ability to model
+    a full joint density vs. from the domain-translation architecture around it
+    (G_sr/G_rs, WDGRL critics). Deliberately capacity-matched to the flow it
+    replaces (MAF5 has 294,640 params; this default shape -- 128->256->256->256->
+    256->128->128->24, dropout after each hidden layer -- has 282,904, within 4%)
+    so a negative result can't be dismissed as "just needed more capacity". The
+    structural difference actually under test: point prediction + dropout-only
+    uncertainty vs. an invertible normalizing flow's full density.
+
+    Exposes log_prob()/sample() with the SAME call signature as the flow objects
+    build_flow_net returns, so existing training/eval code (loss_sim_posterior,
+    loss_real_posterior, loss_generator, every eval_*.py script) works completely
+    unchanged, and whole-object pickling (torch.save(model, path), matching the
+    existing flow_sim.pt/flow_real.pt save pattern) round-trips transparently --
+    torch.load reconstructs whichever class was actually saved.
+
+    log_prob(theta, condition=z) returns -MSE (in z-scored theta space), not a
+    normalized log-density -- an implicit fixed-variance-Gaussian quasi-density,
+    equal to plain MSE up to an additive constant and scale factor that don't
+    affect gradients or relative comparisons within a single training run.
+
+    sample(shape, condition=z) draws shape[0] independent forward passes, each
+    with a fresh dropout mask, and FORCES dropout active internally regardless of
+    the module's own train()/eval() state -- a single deterministic pass gives
+    zero spread, so "sample" is only meaningful here via MC-dropout (unlike the
+    flow, which can sample from a real learned distribution with dropout off).
+    """
+
+    def __init__(self, latent_dim: int, theta_stats: torch.Tensor,
+                hidden_widths=(256, 256, 256, 256, 128, 128), dropout: float = 0.1):
+        super().__init__()
+        theta_mean = theta_stats.mean(0)
+        theta_std  = theta_stats.std(0) + 1e-8
+        self.register_buffer('theta_mean', theta_mean)
+        self.register_buffer('theta_std', theta_std)
+
+        layers = []
+        d = latent_dim
+        for w in hidden_widths:
+            layers += [nn.Linear(d, w), nn.SiLU(), nn.Dropout(dropout)]
+            d = w
+        layers += [nn.Linear(d, theta_mean.shape[0])]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, latent_dim). Returns theta_hat in PHYSICAL units (un-z-scored)."""
+        theta_hat_z = self.net(z)
+        return theta_hat_z * self.theta_std + self.theta_mean
+
+    def log_prob(self, theta: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        """-MSE per sample, in z-scored theta space -- see class docstring."""
+        theta_hat_z = self.net(condition)
+        theta_z = (theta - self.theta_mean) / self.theta_std
+        mse = ((theta_hat_z - theta_z) ** 2).mean(dim=-1)
+        return -mse
+
+    def sample(self, sample_shape, condition: torch.Tensor) -> torch.Tensor:
+        """condition: (B, latent_dim). Returns (*sample_shape, B, theta_dim), matching
+        the flow's convention (only sample_shape=(n,) is used anywhere in this
+        codebase). Forces dropout active for the duration regardless of the
+        module's own mode, then restores it -- MC-dropout is the only source of
+        spread for a point predictor."""
+        n = sample_shape[0] if len(sample_shape) > 0 else 1
+        dropout_mods = [m for m in self.modules() if isinstance(m, nn.Dropout)]
+        was_training = [m.training for m in dropout_mods]
+        for m in dropout_mods:
+            m.train()
+        try:
+            samples = torch.stack([self.forward(condition) for _ in range(n)], dim=0)
+        finally:
+            for m, state in zip(dropout_mods, was_training):
+                m.train(state)
+        return samples
+
+
 # ── Generators G_sr / G_rs ────────────────────────────────────────────────────
 
 class DualBranchGenerator(nn.Module):

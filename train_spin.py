@@ -170,7 +170,7 @@ _WAVE_DIM = N_REDUCED_CHANNELS * T  # 804
 _PROBE_KERNEL = 5  # low/high-freq split kernel for the live stego probe, matches
                    # eval_stego_probe_v3.py's _HF_KERNEL for direct comparability
 from models import (
-    LipschitzEncoder, build_flow_net,
+    LipschitzEncoder, build_flow_net, MLPPosteriorHead,
     DualBranchGenerator, DualBranchDiscriminator,
 )
 
@@ -511,6 +511,19 @@ def main():
                              "task-relevant term that should fade in importance over training. "
                              "0.2 is a starting estimate, not empirically tuned -- see module "
                              "docstring.")
+    parser.add_argument("--posterior-model", choices=["flow", "mlp"], default="flow",
+                        help="v4: 'mlp' replaces BOTH flow_sim and flow_real with "
+                             "MLPPosteriorHead (point prediction + dropout-only uncertainty, "
+                             "capacity-matched to the MAF5 flow it replaces -- see models.py). "
+                             "Isolates how much of SPIN's calibration comes from the flow's "
+                             "full-density modeling vs. the domain-translation architecture "
+                             "itself. --flow-dropout is ignored in this mode; use "
+                             "--mlp-dropout instead. Default 'flow' (unchanged behavior).")
+    parser.add_argument("--mlp-dropout", type=float, default=0.1,
+                        help="v4: dropout rate for MLPPosteriorHead (both flow_sim and "
+                             "flow_real replacements), only used when --posterior-model mlp. "
+                             "Default 0.1, reused from --flow-dropout's validated value (v3f "
+                             "confirmed 0.1 works well; v3g's 0.2 over-regularized).")
     parser.add_argument("--flow-dropout", type=float, default=0.0,
                         help="v3f: dropout_probability inside flow_real's MADE/conditioner "
                              "blocks (nflows' build_maf, forwarded via sbi's posterior_nn). "
@@ -671,11 +684,27 @@ def main():
     theta_all = sim_ds.theta[:min(10_000, len(sim_ds))]
 
     # ── Models ────────────────────────────────────────────────────────────────
-    E_sim     = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
-    flow_sim  = build_flow_net(args.latent_dim, theta_all).to(device)
-    E_real    = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
-    flow_real = build_flow_net(args.latent_dim, theta_all,
-                               dropout_probability=args.flow_dropout).to(device)
+    E_sim  = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
+    E_real = LipschitzEncoder(latent_dim=args.latent_dim, n_scalars=n_scalars).to(device)
+    if args.posterior_model == "mlp":
+        # v4: point-prediction MLP+dropout replacing the flow on both sides, to
+        # isolate how much of SPIN's real-patient calibration comes from the
+        # flow's full-density modeling vs. the domain-translation architecture
+        # itself -- see models.py's MLPPosteriorHead docstring.
+        flow_sim  = MLPPosteriorHead(args.latent_dim, theta_all, dropout=args.mlp_dropout).to(device)
+        flow_real = MLPPosteriorHead(args.latent_dim, theta_all, dropout=args.mlp_dropout).to(device)
+        if abs(args.lam_real_max - 1.0) < 1e-9:
+            log("WARNING: --posterior-model mlp with --lam-real-max at its old flow-era "
+                "default (1.0). The MLP's MSE-based L_real is ~20-40x smaller in typical "
+                "magnitude than the flow's unclamped NLL was (see experiments.csv, v4 row) "
+                "-- L_real will be far less dominant in the generator's total loss than in "
+                "any prior run unless --lam-real-max is raised to compensate (reasoned "
+                "estimate: ~30). Proceeding as configured, but this is very likely not what "
+                "you want.")
+    else:
+        flow_sim  = build_flow_net(args.latent_dim, theta_all).to(device)
+        flow_real = build_flow_net(args.latent_dim, theta_all,
+                                   dropout_probability=args.flow_dropout).to(device)
     G_sr    = DualBranchGenerator(wave_only=args.freeze_scalars,
                                   drop_finest_skip=args.drop_finest_skip).to(device)
     G_rs    = DualBranchGenerator(wave_only=args.freeze_scalars,
@@ -713,6 +742,8 @@ def main():
     log(f"E_real anchor: lam_real_max={args.lam_real_max}  real_ramp={args.real_ramp}")
     log(f"Smoothness penalty (both generators, v3c): lam_smooth={args.lam_smooth}")
     log(f"Latent conditioning noise (v3e): z_noise_sigma={args.z_noise_sigma}")
+    log(f"Posterior model (v4): posterior_model={args.posterior_model}"
+        + (f"  mlp_dropout={args.mlp_dropout}" if args.posterior_model == "mlp" else ""))
     log(f"Flow conditioner dropout (v3f, flow_real only): flow_dropout={args.flow_dropout}")
     log(f"Drop finest UNet skip (v3h, both generators): drop_finest_skip={args.drop_finest_skip}")
     log(f"Mixup (v3b): use_mixup={args.use_mixup}  mixup_alpha={args.mixup_alpha}")
@@ -1087,6 +1118,8 @@ def main():
                 "z_noise_sigma": args.z_noise_sigma,
                 "flow_dropout": args.flow_dropout,
                 "drop_finest_skip": args.drop_finest_skip,
+                "posterior_model": args.posterior_model,
+                "mlp_dropout": args.mlp_dropout,
             },
             "flags": {
                 "freeze_scalars": args.freeze_scalars,
