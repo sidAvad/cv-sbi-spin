@@ -243,10 +243,14 @@ def mixup_real(real_beats: torch.Tensor, n: int, alpha: float, device) -> torch.
     802-patient) real set. Ported from exp/dual-flow-anchor's train_spin.py
     (originally from cv-dann-sbi/train_joint.py's proven v3 recipe).
     """
-    idx_i = torch.randint(0, len(real_beats), (n,), device=device)
-    idx_j = torch.randint(0, len(real_beats), (n,), device=device)
-    lam   = torch.distributions.Beta(alpha, alpha).sample((n,)).to(device).unsqueeze(1)
-    return lam * real_beats[idx_i] + (1 - lam) * real_beats[idx_j]
+    # real_beats (real_ds.x) stays CPU-resident in this codebase (unlike
+    # dual-flow-anchor's pre-moved real_beats_gpu) -- index/mix on CPU to match,
+    # move only the final small batch to device, same as the non-mixup branch below.
+    idx_i = torch.randint(0, len(real_beats), (n,))
+    idx_j = torch.randint(0, len(real_beats), (n,))
+    lam   = torch.distributions.Beta(alpha, alpha).sample((n,)).unsqueeze(1)
+    mixed = lam * real_beats[idx_i] + (1 - lam) * real_beats[idx_j]
+    return mixed.to(device)
 
 
 def main():
