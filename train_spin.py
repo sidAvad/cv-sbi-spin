@@ -235,6 +235,20 @@ def make_log(run_dir: Path):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
+def mixup_real(real_beats: torch.Tensor, n: int, alpha: float, device) -> torch.Tensor:
+    """
+    Beta(alpha,alpha)-interpolated pairs of real patients -- augments the
+    critic's real-side training data so it doesn't just memorize the (small,
+    802-patient) real set. Ported from exp/dual-flow-anchor's train_spin.py
+    (originally from cv-dann-sbi/train_joint.py's proven v3 recipe).
+    """
+    idx_i = torch.randint(0, len(real_beats), (n,), device=device)
+    idx_j = torch.randint(0, len(real_beats), (n,), device=device)
+    lam   = torch.distributions.Beta(alpha, alpha).sample((n,)).to(device).unsqueeze(1)
+    return lam * real_beats[idx_i] + (1 - lam) * real_beats[idx_j]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run",          required=True)
@@ -267,6 +281,12 @@ def main():
     parser.add_argument("--batch-size",   type=int, default=512)
     parser.add_argument("--lr-npe",       type=float, default=1e-4)
     parser.add_argument("--lr-gan",       type=float, default=1e-4)
+    parser.add_argument("--use-mixup",    action="store_true",
+                        help="Beta(alpha,alpha)-interpolate real patient pairs for the "
+                             "critic's real-batch sampling, instead of raw draws -- ported from "
+                             "exp/dual-flow-anchor's train_spin.py")
+    parser.add_argument("--mixup-alpha",  type=float, default=0.2,
+                        help="Beta distribution concentration for --use-mixup")
     parser.add_argument("--latent-dim",   type=int, default=128)
     parser.add_argument("--stats-path",   default="norm_stats.json")
     parser.add_argument("--resume",       action="store_true",
@@ -419,7 +439,9 @@ def main():
         real_iter = iter(real_dl)
 
         def sample_real(n):
-            """Fresh in-memory random real batch of size n."""
+            """Fresh in-memory random real batch of size n (optionally mixup-interpolated)."""
+            if args.use_mixup:
+                return mixup_real(real_ds.x, n, args.mixup_alpha, device)
             idx = torch.randint(0, len(real_ds), (n,))
             return real_ds.x[idx].to(device)
 
